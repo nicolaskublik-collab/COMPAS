@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#101211">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' file: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-src 'none'">
+    <title>Compás — Reproductor multitrack en vivo</title>
+    <link rel="stylesheet" href="styles.css">
+    <script type="module" src="renderer.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="library-panel" aria-label="Canciones del setlist actual">
+        <a class="brand" href="#" aria-label="Compás, inicio">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 32 32" fill="none">
+              <path d="M7 11.5v9M13 7v18M19 11.5v9M25 5v22" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+            </svg>
+          </span>
+          <span class="brand-name">compás<span class="brand-period">.</span></span>
+        </a>
+
+        <div class="library-heading">
+          <div>
+            <p class="eyebrow">LISTA ACTUAL</p>
+            <h1>Canciones</h1>
+          </div>
+          <span class="library-count" aria-label="Canciones del setlist">—</span>
+        </div>
+
+        <nav class="library-nav setlist-queue-nav" aria-label="Canciones del setlist seleccionado">
+          <h2 class="section-label" data-setlist-queue-heading>SELECCIONA UN SETLIST</h2>
+          <ul id="setlist-list" class="setlist-list" aria-label="Tus setlists">
+            <li class="empty-setlists" data-empty-state>Las canciones de la lista aparecerán aquí.</li>
+          </ul>
+        </nav>
+
+        <div class="sidebar-footer">
+          <span class="connection-dot" aria-hidden="true"></span>
+          <span>Listo para la sesión</span>
+          <span class="version-label">ESCRITORIO</span>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div class="breadcrumb"><span>Compás</span><span class="breadcrumb-slash">/</span><span class="breadcrumb-current" data-current-view-label>Setlists</span></div>
+          <div class="topbar-right">
+            <label class="active-setlist-picker">
+              <span>SETLIST</span>
+              <select id="active-setlist-select" aria-label="Cambiar setlist">
+                <option value="">Selecciona un setlist</option>
+              </select>
+            </label>
+            <span class="session-label"><span class="live-dot" aria-hidden="true"></span> SESIÓN LOCAL</span>
+            <nav class="view-navigation" aria-label="Vistas principales">
+              <a class="view-nav-link" href="#setlists-view" id="setlists-button" aria-controls="setlists-view">Setlists</a>
+              <a class="view-nav-link" href="#library-view" id="library-button" aria-controls="library-view">Explorar</a>
+              <a class="view-nav-link" href="#settings-view" id="settings-button" aria-controls="settings-view" aria-expanded="false">Configuración</a>
+            </nav>
+            <button class="icon-button help-button" type="button" aria-label="Ayuda">
+              <svg aria-hidden="true" viewBox="0 0 20 20" fill="none">
+                <circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.4"/>
+                <path d="M8.2 7.7a1.9 1.9 0 1 1 3.2 1.4c-.9.8-1.4 1.1-1.4 2.2M10 14.2v.1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+              </svg>
+            </button>
+          </div>
+        </header>
+
+        <section class="setlists-view" id="setlists-view" aria-labelledby="setlists-view-heading">
+          <div class="setlists-view-topline">
+            <div>
+              <p class="eyebrow">PREPARA CADA FECHA</p>
+              <h1 id="setlists-view-heading">Tus setlists</h1>
+              <p class="setlists-view-intro">Crea una lista para cada servicio o evento. Las canciones se agregan desde tu biblioteca y pueden variar en cada setlist.</p>
+            </div>
+          </div>
+          <section class="setlist-create-card" aria-labelledby="create-setlist-heading">
+            <div class="setlist-create-copy">
+              <p class="eyebrow">EMPIEZA POR AQUÍ</p>
+              <h2 id="create-setlist-heading">Crea tu primer setlist</h2>
+              <p>Por ejemplo: Culto domingo AM, Culto domingo PM o Culto sábado.</p>
+            </div>
+            <form class="create-setlist-form" data-create-setlist-form>
+              <label class="visually-hidden" for="setlist-name">Nombre del nuevo setlist</label>
+              <input id="setlist-name" name="setlist-name" type="text" maxlength="120" placeholder="Ej. Culto domingo AM" autocomplete="off" aria-label="Nombre del nuevo setlist" required>
+              <button id="create-setlist-button" class="button button-primary" type="submit">Crear setlist</button>
+            </form>
+          </section>
+          <section class="setlist-overview" aria-labelledby="setlist-overview-heading">
+            <div class="setlist-overview-heading">
+              <div>
+                <p class="eyebrow">TUS EVENTOS</p>
+                <h2 id="setlist-overview-heading">Listas creadas</h2>
+              </div>
+              <span class="setlist-overview-count" id="setlist-overview-count">0</span>
+            </div>
+            <ul class="setlist-cards" id="setlist-cards" aria-label="Setlists creados"></ul>
+          </section>
+        </section>
+
+        <section class="setlist-detail-view" id="setlist-detail-view" aria-labelledby="setlist-detail-title">
+          <div class="setlist-detail-topline">
+            <div>
+              <p class="eyebrow">SETLIST SELECCIONADO</p>
+              <h1 id="setlist-detail-title">Setlist</h1>
+              <p class="setlists-view-intro" id="setlist-detail-description"></p>
+            </div>
+            <div class="setlist-detail-actions">
+              <a class="view-nav-link" href="#setlists-view" aria-controls="setlists-view">Todos los setlists</a>
+              <a class="button button-primary setlist-add-songs" id="setlist-add-songs" href="#library-view" aria-controls="library-view">Explorar canciones</a>
+            </div>
+          </div>
+          <section class="setlist-song-section" aria-labelledby="setlist-songs-heading">
+            <div class="setlist-overview-heading">
+              <div>
+                <p class="eyebrow">ORDEN DE REPRODUCCIÓN</p>
+                <h2 id="setlist-songs-heading">Canciones del setlist</h2>
+              </div>
+              <span class="setlist-overview-count" id="setlist-song-count">0</span>
+            </div>
+            <ul class="setlist-songs" id="setlist-songs-list" aria-label="Canciones de este setlist"></ul>
+          </section>
+        </section>
+
+        <div class="content-scroll" id="player-view">
+          <section class="now-playing" aria-labelledby="song-title">
+            <div class="song-art" aria-hidden="true">
+              <span class="art-glow"></span>
+              <svg viewBox="0 0 80 80" fill="none">
+                <path d="M21 29v22M31 21v38M41 27v26M51 18v44M61 29v22" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+              </svg>
+            </div>
+            <div class="song-information">
+              <p class="eyebrow">REPRODUCIENDO AHORA</p>
+              <h2 id="song-title">Selecciona una canción</h2>
+              <p id="song-meta" class="song-meta">Añade pistas a tu biblioteca para empezar</p>
+            </div>
+            <div class="now-playing-badge"><span aria-hidden="true">●</span> MULTITRACK</div>
+          </section>
+
+          <section class="waveform-panel" aria-labelledby="waveform-heading">
+            <div class="waveform-heading">
+              <div>
+                <p class="eyebrow">VISOR MULTITRACK</p>
+                <h2 id="waveform-heading">Forma de onda <span>por pista</span></h2>
+              </div>
+              <span class="waveform-status" id="waveform-status" role="status" aria-live="polite">Selecciona una canción</span>
+            </div>
+            <div class="song-rhythm-controls" aria-label="Tempo y sincronización">
+              <label class="rhythm-tempo-field" for="click-bpm">
+                <span>TEMPO DE LA CANCIÓN</span>
+                <span class="rhythm-number-field"><input id="click-bpm" type="number" min="30" max="300" value="120" inputmode="numeric" aria-label="Tempo de la canción y del click en BPM"><span>BPM</span></span>
+              </label>
+              <label class="rhythm-meter-field" for="click-beats">
+                <span>COMPÁS</span>
+                <select id="click-beats" aria-label="Compás del click">
+                  <option value="2">2 / 4</option>
+                  <option value="3">3 / 4</option>
+                  <option value="4" selected>4 / 4</option>
+                  <option value="5">5 / 4</option>
+                  <option value="6">6 / 8</option>
+                  <option value="7">7 / 8</option>
+                </select>
+              </label>
+              <span class="rhythm-sync-note">Analiza y sincroniza las pistas al reproducir</span>
+              <output class="rhythm-sync-status" data-click-status aria-live="polite">Selecciona una canción</output>
+            </div>
+            <div class="waveform-canvas-wrap">
+              <canvas id="song-waveform" role="slider" tabindex="0" aria-label="Posición de reproducción en la forma de onda" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0" aria-valuetext="00:00"></canvas>
+            </div>
+          </section>
+
+          <section class="transport-panel" aria-label="Controles de reproducción">
+            <div class="transport-controls">
+              <button id="stop-button" class="transport-button stop-button" type="button" aria-label="Detener reproducción" title="Detener">
+                <svg aria-hidden="true" viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>
+              </button>
+              <button id="play-button" class="transport-button play-button" type="button" aria-label="Reproducir" title="Reproducir">
+                <svg class="play-icon" aria-hidden="true" viewBox="0 0 24 24" fill="currentColor"><path d="M8.2 5.8a1 1 0 0 1 1.5-.86l9.1 5.2a1 1 0 0 1 0 1.72l-9.1 5.2a1 1 0 0 1-1.5-.86V5.8Z"/></svg>
+              </button>
+              <span class="transport-divider" aria-hidden="true"></span>
+              <div class="position-readout">
+                <span class="readout-label">POSICIÓN</span>
+                <output id="position-display" aria-label="Posición actual">00:00</output>
+              </div>
+            </div>
+            <div class="timeline">
+              <span class="timeline-start" aria-hidden="true">00:00</span>
+              <label class="visually-hidden" for="progress-bar">Posición de reproducción</label>
+              <input id="progress-bar" class="range-input progress-range" type="range" min="0" max="100" value="0" aria-label="Posición de reproducción">
+              <span class="timeline-end" data-duration aria-label="Duración total">--:--</span>
+            </div>
+            <div class="master-control">
+              <label for="master-volume">
+                <svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><path d="M3 8v4h3l4 3V5L6 8H3Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M13 7.2a4 4 0 0 1 0 5.6M15.5 5a7.1 7.1 0 0 1 0 10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+                <span>MASTER</span>
+              </label>
+              <input id="master-volume" class="range-input volume-range" type="range" min="0" max="100" value="80" aria-label="Volumen maestro">
+              <output class="volume-value" data-master-volume-value>80%</output>
+            </div>
+          </section>
+
+          <div class="section-toolbar">
+            <div class="tracks-heading">
+              <div>
+                <p class="eyebrow">MEZCLA EN VIVO</p>
+                <h2>Pistas <span class="track-count" data-track-count>—</span></h2>
+              </div>
+            </div>
+          </div>
+
+          <section id="track-list" class="track-list" aria-label="Pistas de la canción" aria-live="polite">
+            <div class="tracks-empty" data-empty-state>
+              <div class="empty-wave" aria-hidden="true">
+                <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+              </div>
+              <h3>Las pistas aparecerán aquí</h3>
+              <p>Selecciona una canción de tu biblioteca para controlar cada instrumento.</p>
+            </div>
+          </section>
+
+          <footer class="workspace-footer">
+            <span id="status-message" role="status" aria-live="polite">Todo listo. Añade una canción para comenzar.</span>
+            <span class="audio-format"><span class="audio-dot" aria-hidden="true"></span> AUDIO LOCAL</span>
+          </footer>
+        </div>
+
+        <section class="settings-view" id="settings-view" aria-labelledby="settings-heading" hidden>
+          <div class="settings-topline">
+            <div>
+              <p class="eyebrow">PREFERENCIAS DE SESIÓN</p>
+              <h1 id="settings-heading">Configuración</h1>
+              <p class="settings-intro">Dispositivos de audio y controles MIDI para la sesión.</p>
+            </div>
+            <a class="view-nav-link settings-return" href="#setlists-view" aria-controls="setlists-view">Volver a la vista anterior</a>
+          </div>
+
+          <section class="settings-card" aria-labelledby="audio-settings-heading">
+            <div class="settings-card-heading">
+              <div>
+                <p class="eyebrow">DISPOSITIVO DE SALIDA</p>
+                <h2 id="audio-settings-heading">Audio y ASIO</h2>
+              </div>
+              <span class="settings-badge">Motor nativo</span>
+            </div>
+            <p class="settings-description">Selecciona un controlador ASIO o una salida WASAPI y asigna cada pista al master estéreo, a una salida mono o a un par estéreo.</p>
+
+            <div class="settings-control-row">
+              <div class="settings-field">
+                <label for="audio-api-select">Sistema de audio</label>
+                <select id="audio-api-select" name="audio-api">
+                  <option value="asio">ASIO</option>
+                  <option value="wasapi">WASAPI</option>
+                </select>
+              </div>
+              <div class="settings-field">
+                <label for="asio-driver-select">Dispositivo</label>
+                <select id="asio-driver-select" name="asio-driver">
+                  <option value="">Actualiza los dispositivos de audio</option>
+                </select>
+              </div>
+              <button class="button button-secondary" id="refresh-audio-devices" type="button">Actualizar dispositivos</button>
+            </div>
+
+            <p class="settings-status" id="audio-driver-status" role="status" aria-live="polite">Actualiza los dispositivos para iniciar el motor de audio nativo.</p>
+            <div class="settings-info-grid">
+              <div class="settings-info">
+                <span>Salidas disponibles</span>
+                <p id="asio-channel-status" role="status">Aún no se consultó el dispositivo.</p>
+              </div>
+              <div class="settings-info">
+                <span>Enrutamiento por pista</span>
+                <p id="audio-route-status" role="status">Cada canal puede enviarse al master o a salidas físicas independientes.</p>
+              </div>
+            </div>
+            <p class="settings-note">El pitch se procesa sin modificar la duración. El rendimiento de time-stretch depende del equipo y de la cantidad de pistas.</p>
+          </section>
+
+          <section class="settings-card" aria-labelledby="midi-settings-heading">
+            <div class="settings-card-heading">
+              <div>
+                <p class="eyebrow">CONTROL EXTERNO</p>
+                <h2 id="midi-settings-heading">MIDI</h2>
+              </div>
+              <span class="settings-badge">MIDI Learn</span>
+            </div>
+            <p class="settings-description">Activa el acceso MIDI, elige una entrada y aprende Reproducir, Detener o Siguiente canción desde tu controlador.</p>
+
+            <div class="settings-control-row midi-enable-row">
+              <p class="settings-field-copy">El acceso depende de la compatibilidad Web MIDI de Windows y del dispositivo.</p>
+              <button class="button button-secondary" id="midi-enable-button" type="button" aria-describedby="midi-status">Buscar entradas MIDI</button>
+            </div>
+
+            <div class="midi-learn-form">
+              <div class="settings-field">
+                <label for="midi-input-select">Dispositivo de entrada MIDI</label>
+                <select id="midi-input-select" name="midi-input">
+                  <option value="">Dispositivos de entrada aparecerán aquí</option>
+                </select>
+              </div>
+              <div class="settings-field">
+                <label for="midi-learn-action">Acción que se aprenderá</label>
+                <select id="midi-learn-action" name="midi-action">
+                  <option value="play">Reproducir</option>
+                  <option value="stop">Detener</option>
+                  <option value="next">Siguiente canción</option>
+                </select>
+              </div>
+              <div class="midi-learn-actions">
+                <button class="button button-primary" id="midi-learn-button" type="button" aria-describedby="midi-status">Iniciar MIDI Learn</button>
+                <button class="button button-secondary" id="midi-cancel-learn" type="button" aria-describedby="midi-status" hidden>Cancelar aprendizaje</button>
+              </div>
+            </div>
+            <p class="settings-status" id="midi-status" role="status" aria-live="polite">Busca un controlador para comenzar MIDI Learn.</p>
+
+            <div class="midi-mappings">
+              <h3>Asignaciones MIDI</h3>
+              <ul id="midi-mappings-list" aria-label="Asignaciones MIDI">
+                <li class="midi-empty">Todavía no hay asignaciones.</li>
+              </ul>
+            </div>
+          </section>
+        </section>
+
+        <section class="library-browser-view" id="library-view" aria-labelledby="library-view-heading">
+          <div class="library-browser-topline">
+            <div>
+              <p class="eyebrow">TU COLECCIÓN</p>
+              <h1 id="library-view-heading">Explorar biblioteca</h1>
+              <p class="library-browser-intro">Busca y organiza tus canciones por artista, tempo y tonalidad.</p>
+            </div>
+            <a class="view-nav-link library-return" href="#setlist-detail-view" aria-controls="setlist-detail-view">Volver al setlist</a>
+          </div>
+
+          <section class="click-song-create library-click-song-create" aria-labelledby="click-song-create-heading">
+            <div class="click-song-status"><span class="click-song-status-dot" aria-hidden="true"></span>Modo solo click disponible</div>
+            <h2 id="click-song-create-heading">Crear canción solo con click</h2>
+            <p>Prepara una canción sin pistas de audio y agrégala a un setlist cuando quieras.</p>
+            <form class="create-click-song-form" data-create-click-song-form aria-label="Crear canción solo con click">
+              <label class="visually-hidden" for="click-song-title">Título de la canción solo con click</label>
+              <input id="click-song-title" name="click-song-title" type="text" placeholder="Título de la canción" autocomplete="off" aria-label="Título de la canción solo con click">
+              <button id="create-click-song-button" class="button button-primary" type="submit" aria-label="Crear canción solo con click">Crear</button>
+            </form>
+          </section>
+
+          <section class="library-browser-card" aria-labelledby="library-filters-heading">
+            <div class="library-browser-card-heading">
+              <div>
+                <p class="eyebrow">ENCUENTRA UNA CANCIÓN</p>
+                <h2 id="library-filters-heading">Búsqueda y filtros</h2>
+              </div>
+              <details class="import-dialog" id="import-song-dialog">
+                <summary class="button button-primary import-song-trigger">
+                  <svg aria-hidden="true" viewBox="0 0 20 20" fill="none">
+                    <path d="M10 4v12M4 10h12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                  </svg>
+                  <span>Importar canción</span>
+                </summary>
+                <div class="import-dialog-backdrop">
+                  <section class="import-dialog-card" role="dialog" aria-modal="true" aria-labelledby="import-song-heading" aria-describedby="import-song-description">
+                    <div class="import-dialog-heading">
+                      <div>
+                        <p class="eyebrow">AÑADIR A LA BIBLIOTECA</p>
+                        <h2 id="import-song-heading">Importar canción</h2>
+                      </div>
+                      <span class="import-format-badge">WAV · MP3 · FLAC · OGG</span>
+                    </div>
+                    <p class="import-dialog-description" id="import-song-description">Completa los datos de la canción y selecciona sus archivos de audio.</p>
+                    <form class="song-import-form" aria-label="Datos de la canción">
+                      <div class="import-fields-grid">
+                        <div class="library-field import-field-wide">
+                          <label for="import-song-name">Nombre de la canción</label>
+                          <input id="import-song-name" name="song-name" type="text" maxlength="120" placeholder="Ej. Luz en el camino" autocomplete="off" required>
+                        </div>
+                        <div class="library-field">
+                          <label for="import-song-artist">Artista</label>
+                          <input id="import-song-artist" name="artist" type="text" maxlength="120" placeholder="Nombre del artista" autocomplete="off" required>
+                        </div>
+                        <div class="library-field">
+                          <label for="import-song-bpm">Tempo</label>
+                          <div class="library-number-field">
+                            <input id="import-song-bpm" name="bpm" type="number" min="30" max="300" inputmode="numeric" placeholder="120" required>
+                            <span aria-hidden="true">BPM</span>
+                          </div>
+                        </div>
+                        <div class="library-field import-field-wide">
+                          <label for="import-song-key">Tonalidad (notación americana)</label>
+                          <select id="import-song-key" name="key" required>
+                            <option value="">Selecciona una tonalidad</option>
+                            <option value="C">C mayor</option><option value="C#">C♯ mayor</option><option value="Db">D♭ mayor</option>
+                            <option value="D">D mayor</option><option value="D#">D♯ mayor</option><option value="Eb">E♭ mayor</option>
+                            <option value="E">E mayor</option><option value="F">F mayor</option><option value="F#">F♯ mayor</option>
+                            <option value="Gb">G♭ mayor</option><option value="G">G mayor</option><option value="G#">G♯ mayor</option>
+                            <option value="Ab">A♭ mayor</option><option value="A">A mayor</option><option value="A#">A♯ mayor</option>
+                            <option value="Bb">B♭ mayor</option><option value="B">B mayor</option>
+                            <option value="Cm">C menor</option><option value="C#m">C♯ menor</option><option value="Dbm">D♭ menor</option>
+                            <option value="Dm">D menor</option><option value="D#m">D♯ menor</option><option value="Ebm">E♭ menor</option>
+                            <option value="Em">E menor</option><option value="Fm">F menor</option><option value="F#m">F♯ menor</option>
+                            <option value="Gbm">G♭ menor</option><option value="Gm">G menor</option><option value="G#m">G♯ menor</option>
+                            <option value="Abm">A♭ menor</option><option value="Am">A menor</option><option value="A#m">A♯ menor</option>
+                            <option value="Bbm">B♭ menor</option><option value="Bm">B menor</option>
+                          </select>
+                        </div>
+                      </div>
+                      <div class="import-files-field">
+                        <label for="import-song-files">Archivos de la canción</label>
+                        <button class="file-picker" id="import-song-files" type="button" aria-describedby="import-files-help">
+                          <span class="file-picker-icon" aria-hidden="true">＋</span>
+                          <span><strong>Seleccionar archivos de audio</strong><small>Elige las pistas que forman esta canción</small></span>
+                        </button>
+                        <small class="import-files-help" id="import-files-help">Puedes seleccionar varias pistas a la vez. Formatos admitidos: WAV, MP3, FLAC y OGG.</small>
+                      </div>
+                      <div class="import-dialog-actions">
+                        <span class="import-required-note">Los archivos permanecen en su ubicación original.</span>
+                        <button class="button button-primary" id="save-imported-song-button" type="submit">Añadir canción</button>
+                      </div>
+                    </form>
+                  </section>
+                </div>
+              </details>
+            </div>
+
+            <form class="library-search-form" aria-label="Buscar y filtrar canciones">
+              <div class="library-field library-search-field">
+                <label for="library-search">Buscar</label>
+                <div class="library-search-input-wrap">
+                  <svg aria-hidden="true" viewBox="0 0 20 20" fill="none">
+                    <circle cx="8.8" cy="8.8" r="5.6" stroke="currentColor" stroke-width="1.5"/>
+                    <path d="m13 13 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                  </svg>
+                  <input id="library-search" name="query" type="search" placeholder="Nombre de canción o artista" autocomplete="off">
+                </div>
+              </div>
+              <div class="library-field">
+                <label for="library-filter-artist">Artista</label>
+                <input id="library-filter-artist" name="artist-filter" type="search" placeholder="Todos los artistas" autocomplete="off">
+              </div>
+              <div class="library-field">
+                <label for="library-filter-bpm">Tempo (BPM)</label>
+                <input id="library-filter-bpm" name="bpm-filter" type="number" min="30" max="300" inputmode="numeric" placeholder="Cualquier tempo">
+              </div>
+              <div class="library-field">
+                <label for="library-filter-key">Tonalidad</label>
+                <select id="library-filter-key" name="key-filter">
+                  <option value="">Todas</option>
+                  <option value="C">C mayor</option><option value="C#">C♯ mayor</option><option value="Db">D♭ mayor</option>
+                  <option value="D">D mayor</option><option value="D#">D♯ mayor</option><option value="Eb">E♭ mayor</option>
+                  <option value="E">E mayor</option><option value="F">F mayor</option><option value="F#">F♯ mayor</option>
+                  <option value="Gb">G♭ mayor</option><option value="G">G mayor</option><option value="G#">G♯ mayor</option>
+                  <option value="Ab">A♭ mayor</option><option value="A">A mayor</option><option value="A#">A♯ mayor</option>
+                  <option value="Bb">B♭ mayor</option><option value="B">B mayor</option>
+                  <option value="Cm">C menor</option><option value="C#m">C♯ menor</option><option value="Dbm">D♭ menor</option>
+                  <option value="Dm">D menor</option><option value="D#m">D♯ menor</option><option value="Ebm">E♭ menor</option>
+                  <option value="Em">E menor</option><option value="Fm">F menor</option><option value="F#m">F♯ menor</option>
+                  <option value="Gbm">G♭ menor</option><option value="Gm">G menor</option><option value="G#m">G♯ menor</option>
+                  <option value="Abm">A♭ menor</option><option value="Am">A menor</option><option value="A#m">A♯ menor</option>
+                  <option value="Bbm">B♭ menor</option><option value="Bm">B menor</option>
+                </select>
+              </div>
+            </form>
+          </section>
+
+          <section class="library-results-section" aria-labelledby="library-results-heading">
+            <div class="library-results-heading">
+              <div>
+                <p class="eyebrow">COLECCIÓN LOCAL</p>
+                <h2 id="library-results-heading">Canciones <span class="library-results-count" id="library-results-count">—</span></h2>
+              </div>
+              <span class="library-results-hint">Usa + para agregar una canción al setlist seleccionado</span>
+            </div>
+            <ul class="library-results-list" id="library-results-list" aria-label="Resultados de la biblioteca" aria-live="polite"></ul>
+          </section>
+        </section>
+      </main>
+
+      <aside class="mixer-panel" aria-label="Herramientas de sesión">
+        <div class="mixer-header">
+          <div>
+            <p class="eyebrow">HERRAMIENTAS</p>
+            <h2>Sesión</h2>
+          </div>
+          <button class="icon-button more-button" type="button" aria-label="Más opciones">
+            <svg aria-hidden="true" viewBox="0 0 20 20" fill="currentColor"><circle cx="4" cy="10" r="1.4"/><circle cx="10" cy="10" r="1.4"/><circle cx="16" cy="10" r="1.4"/></svg>
+          </button>
+        </div>
+
+        <section class="tool-card session-card" aria-labelledby="session-heading">
+          <div class="tool-card-heading">
+            <div class="tool-icon session-tool-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none"><path d="M5 7h14M5 12h14M5 17h8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="17.5" cy="17" r="2.5" stroke="currentColor" stroke-width="1.5"/></svg>
+            </div>
+            <div class="tool-title">
+              <h3 id="session-heading">Tu sesión</h3>
+              <span>Preparada para directo</span>
+            </div>
+          </div>
+          <div class="song-pitch-control">
+            <div class="song-pitch-heading">
+              <label for="song-pitch">Pitch global de la canción</label>
+              <output data-song-pitch-value for="song-pitch">0 st</output>
+            </div>
+            <input id="song-pitch" class="range-input" type="range" min="-12" max="12" step="1" value="0" aria-label="Pitch de la canción para todas las pistas, en semitonos">
+            <p>Afecta a todas las pistas y conserva la duración. Preparar un cambio de tono puede tardar según la canción.</p>
+          </div>
+          <div class="session-detail"><span>Formato</span><strong>Multitrack</strong></div>
+          <div class="session-detail"><span>Ruteo</span><strong><span class="output-indicator" aria-hidden="true"></span>Master o salida por pista</strong></div>
+          <p class="session-audio-note">ASIO y WASAPI disponibles. Configura MIDI Learn en Ajustes.</p>
+        </section>
+
+        <div class="mixer-tip">
+          <span class="tip-mark" aria-hidden="true">✦</span>
+          <p><strong>Consejo para el directo</strong><br>Prueba tus niveles antes de que comience el servicio.</p>
+        </div>
+
+        <div class="mixer-footer">
+          <span>COMPÁS</span>
+          <span class="footer-divider" aria-hidden="true"></span>
+          <span>HECHO PARA EL ESCENARIO</span>
+        </div>
+      </aside>
+    </div>
+  </body>
+</html>

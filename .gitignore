@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.log
+/library.json
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.opus
+*.m4a
+*.aac
+*.aiff
+native/build/
+native/vendor/asiosdk.zip
+/native/vendor/asiosdk/

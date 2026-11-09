@@ -1,0 +1,78 @@
+{
+  "name": "multitracks-live",
+  "version": "0.1.0",
+  "private": true,
+  "license": "GPL-3.0-only",
+  "description": "Reproductor multitrack local para uso en vivo",
+  "main": "main.cjs",
+  "scripts": {
+    "build:native": "node scripts/build-native.cjs",
+    "start": "npm run build:native && electron .",
+    "check": "node --check main.cjs && node --check preload.cjs && node --check renderer.js && node --check scripts/build-native.cjs && npm run build:native",
+    "test:native": "native\\build\\Release\\compas-audio.exe --test-pitch && native\\build\\Release\\compas-audio.exe --test-tempo-sync",
+    "dist:win": "npm run build:native && electron-builder --win nsis --x64 --publish never"
+  },
+  "devDependencies": {
+    "electron": "^45.2.3",
+    "electron-builder": "^26.18.0"
+  },
+  "build": {
+    "appId": "com.compas.multitracks",
+    "productName": "Compas",
+    "asar": true,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "renderer.js",
+      "index.html",
+      "styles.css",
+      "README.md",
+      "LICENSE"
+    ],
+    "extraResources": [
+      {
+        "from": "native/build/Release/compas-audio.exe",
+        "to": "native/compas-audio.exe"
+      },
+      {
+        "from": "native/vendor/rtaudio/LICENSE",
+        "to": "licenses/rtaudio-LICENSE"
+      },
+      {
+        "from": "native/vendor/signalsmith-stretch/LICENSE.txt",
+        "to": "licenses/signalsmith-stretch-LICENSE.txt"
+      },
+      {
+        "from": "native/vendor/signalsmith-linear/LICENSE.txt",
+        "to": "licenses/signalsmith-linear-LICENSE.txt"
+      },
+      {
+        "from": "native/vendor/MINIAUDIO-LICENSE",
+        "to": "licenses/MINIAUDIO-LICENSE"
+      },
+      {
+        "from": "native/vendor/NLOHMANN-JSON-LICENSE",
+        "to": "licenses/NLOHMANN-JSON-LICENSE"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "artifactName": "Compas-Setup-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}
