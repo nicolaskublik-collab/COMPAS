@@ -1,4 +1,4 @@
-# Compás
+# COMPAS (Compás)
 
 Reproductor multitrack local para preparar canciones y setlists.
 
