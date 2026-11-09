@@ -53,6 +53,7 @@
                 <option value="">Selecciona un setlist</option>
               </select>
             </label>
+            <button class="button button-secondary current-setlist-button" id="open-current-setlist" type="button">Setlist actual</button>
             <span class="session-label"><span class="live-dot" aria-hidden="true"></span> SESIÓN LOCAL</span>
             <nav class="view-navigation" aria-label="Vistas principales">
               <a class="view-nav-link" href="#setlists-view" id="setlists-button" aria-controls="setlists-view">Setlists</a>
@@ -75,6 +76,7 @@
               <h1 id="setlists-view-heading">Tus setlists</h1>
               <p class="setlists-view-intro">Crea una lista para cada servicio o evento. Las canciones se agregan desde tu biblioteca y pueden variar en cada setlist.</p>
             </div>
+            <details class="section-help"><summary aria-label="Ayuda sobre setlists">?</summary><p>Crea una lista para cada servicio, abre su detalle, ordena las canciones con las flechas y usa el botón «Setlist actual» para volver a esta lista desde cualquier momento.</p></details>
           </div>
           <section class="setlist-create-card" aria-labelledby="create-setlist-heading">
             <div class="setlist-create-copy">
@@ -111,6 +113,7 @@
               <a class="view-nav-link" href="#setlists-view" aria-controls="setlists-view">Todos los setlists</a>
               <a class="button button-primary setlist-add-songs" id="setlist-add-songs" href="#library-view" aria-controls="library-view">Explorar canciones</a>
             </div>
+            <details class="section-help"><summary aria-label="Ayuda sobre el orden del setlist">?</summary><p>Las flechas cambian el orden de reproducción. Ese orden también define los números que puedes usar para saltar a una canción desde el teclado.</p></details>
           </div>
           <section class="setlist-song-section" aria-labelledby="setlist-songs-heading">
             <div class="setlist-overview-heading">
@@ -148,6 +151,10 @@
               </div>
               <span class="waveform-status" id="waveform-status" role="status" aria-live="polite">Selecciona una canción</span>
             </div>
+            <details class="section-help">
+              <summary aria-label="Ayuda sobre regiones y forma de onda">?</summary>
+              <p>Haz clic en la forma de onda para saltar a ese momento. Agrega puntos para volver a una parte o marca inicio y fin para crear y repetir una región.</p>
+            </details>
             <div class="song-rhythm-controls" aria-label="Tempo y sincronización">
               <label class="rhythm-tempo-field" for="click-bpm">
                 <span>TEMPO DE LA CANCIÓN</span>
@@ -167,13 +174,28 @@
               <span class="rhythm-sync-note">Analiza y sincroniza las pistas al reproducir</span>
               <output class="rhythm-sync-status" data-click-status aria-live="polite">Selecciona una canción</output>
             </div>
+            <div class="waveform-edit-controls" aria-label="Puntos y regiones">
+              <label class="visually-hidden" for="cue-name">Nombre del próximo punto o región</label>
+              <input id="cue-name" type="text" maxlength="80" placeholder="Nombre del punto o región" aria-label="Nombre del próximo punto o región">
+              <button class="button button-secondary" id="add-marker-button" type="button" disabled>＋ Punto aquí</button>
+              <button class="button button-secondary" id="region-start-button" type="button" disabled>Marcar inicio</button>
+              <button class="button button-secondary" id="region-end-button" type="button" disabled>Marcar fin</button>
+              <span id="region-start-status" role="status" aria-live="polite"></span>
+            </div>
             <div class="waveform-canvas-wrap">
               <canvas id="song-waveform" role="slider" tabindex="0" aria-label="Posición de reproducción en la forma de onda" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0" aria-valuetext="00:00"></canvas>
+            </div>
+            <div class="song-cues">
+              <div><h3>Puntos</h3><ul id="song-markers" aria-label="Puntos guardados"></ul></div>
+              <div><h3>Regiones</h3><ul id="song-regions" aria-label="Regiones guardadas"></ul></div>
             </div>
           </section>
 
           <section class="transport-panel" aria-label="Controles de reproducción">
             <div class="transport-controls">
+              <button id="restart-button" class="transport-button" type="button" aria-label="Reiniciar canción" title="Reiniciar">
+                <svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><path d="M4.5 11a7.5 7.5 0 1 1 2.2 5.3M4.5 11V5.5M4.5 11H10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
               <button id="stop-button" class="transport-button stop-button" type="button" aria-label="Detener reproducción" title="Detener">
                 <svg aria-hidden="true" viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>
               </button>
@@ -186,12 +208,8 @@
                 <output id="position-display" aria-label="Posición actual">00:00</output>
               </div>
             </div>
-            <div class="timeline">
-              <span class="timeline-start" aria-hidden="true">00:00</span>
-              <label class="visually-hidden" for="progress-bar">Posición de reproducción</label>
-              <input id="progress-bar" class="range-input progress-range" type="range" min="0" max="100" value="0" aria-label="Posición de reproducción">
-              <span class="timeline-end" data-duration aria-label="Duración total">--:--</span>
-            </div>
+            <input id="progress-bar" type="range" min="0" max="100" value="0" aria-hidden="true" hidden>
+            <output data-duration hidden>--:--</output>
             <div class="master-control song-master-control">
               <label for="master-volume">
                 <svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><path d="M3 8v4h3l4 3V5L6 8H3Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M13 7.2a4 4 0 0 1 0 5.6M15.5 5a7.1 7.1 0 0 1 0 10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
@@ -214,6 +232,7 @@
                 <h2>Pistas <span class="track-count" data-track-count>—</span></h2>
               </div>
             </div>
+            <details class="section-help"><summary aria-label="Ayuda sobre la mezcla de pistas">?</summary><p>Usa los faders para volumen y paneo, Solo/Mute para cada pista y Salida para enrutarla. El Pitch canción se aplica solo a las pistas que lo permiten.</p></details>
           </div>
 
           <section id="track-list" class="track-list" aria-label="Pistas de la canción" aria-live="polite">
@@ -239,6 +258,7 @@
               <h1 id="settings-heading">Configuración</h1>
               <p class="settings-intro">Dispositivos de audio y controles MIDI para la sesión.</p>
             </div>
+            <details class="section-help"><summary aria-label="Ayuda sobre configuración">?</summary><p>Elige tu interfaz, revisa sus salidas y ajusta sample rate y búfer antes de comenzar la sesión. Los cambios de dispositivo requieren detener el audio.</p></details>
             <a class="view-nav-link settings-return" href="#setlists-view" aria-controls="setlists-view">Volver a la vista anterior</a>
           </div>
 
@@ -250,6 +270,10 @@
               </div>
               <span class="settings-badge">Motor nativo</span>
             </div>
+            <details class="section-help">
+              <summary aria-label="Ayuda sobre audio, frecuencia y búfer">?</summary>
+              <p>Usa el sample rate aceptado por tu interfaz. Un búfer menor reduce latencia, pero puede producir cortes; sube el tamaño si el audio no es estable. Detén la reproducción antes de cambiar estos parámetros.</p>
+            </details>
             <p class="settings-description">Selecciona un controlador ASIO o una salida WASAPI y asigna cada pista al master estéreo, a una salida mono o a un par estéreo.</p>
 
             <div class="settings-control-row">
@@ -267,6 +291,25 @@
                 </select>
               </div>
               <button class="button button-secondary" id="refresh-audio-devices" type="button">Actualizar dispositivos</button>
+            </div>
+            <div class="settings-control-row audio-format-row">
+              <div class="settings-field">
+                <label for="audio-sample-rate">Frecuencia de muestreo</label>
+                <select id="audio-sample-rate" name="sample-rate">
+                  <option value="0">Predeterminada del dispositivo</option>
+                </select>
+              </div>
+              <div class="settings-field">
+                <label for="audio-buffer-size">Tamaño del búfer</label>
+                <select id="audio-buffer-size" name="buffer-size">
+                  <option value="64">64 muestras · menor latencia</option>
+                  <option value="128">128 muestras</option>
+                  <option value="256">256 muestras</option>
+                  <option value="512" selected>512 muestras · recomendado</option>
+                  <option value="1024">1024 muestras</option>
+                  <option value="2048">2048 muestras · mayor estabilidad</option>
+                </select>
+              </div>
             </div>
 
             <p class="settings-status" id="audio-driver-status" role="status" aria-live="polite">Actualiza los dispositivos para iniciar el motor de audio nativo.</p>
@@ -291,7 +334,11 @@
               </div>
               <span class="settings-badge">MIDI Learn</span>
             </div>
-            <p class="settings-description">Activa el acceso MIDI, elige una entrada y aprende Reproducir, Detener o Siguiente canción desde tu controlador.</p>
+            <p class="settings-description">Activa el acceso MIDI, elige una entrada y asigna los controles de reproducción, navegación y puntos de la canción.</p>
+            <details class="section-help">
+              <summary aria-label="Ayuda sobre MIDI Learn">?</summary>
+              <p>Conecta el dispositivo, pulsa Buscar entradas MIDI, selecciona una acción y presiona MIDI Learn. Luego toca el botón físico que quieres asignar.</p>
+            </details>
 
             <div class="settings-control-row midi-enable-row">
               <p class="settings-field-copy">El acceso depende de la compatibilidad Web MIDI de Windows y del dispositivo.</p>
@@ -311,6 +358,11 @@
                   <option value="play">Reproducir</option>
                   <option value="stop">Detener</option>
                   <option value="next">Siguiente canción</option>
+                  <option value="previous">Canción anterior</option>
+                  <option value="restart">Reiniciar canción</option>
+                  <option value="addMarker">Agregar punto</option>
+                  <option value="regionStart">Marcar inicio de región</option>
+                  <option value="regionEnd">Marcar fin de región</option>
                 </select>
               </div>
               <div class="midi-learn-actions">
@@ -326,6 +378,31 @@
                 <li class="midi-empty">Todavía no hay asignaciones.</li>
               </ul>
             </div>
+          </section>
+
+          <section class="settings-card" aria-labelledby="keyboard-settings-heading">
+            <div class="settings-card-heading">
+              <div><p class="eyebrow">ATAJOS PERSONALIZABLES</p><h2 id="keyboard-settings-heading">Teclado Learn</h2></div>
+              <span class="settings-badge">Key Learn</span>
+            </div>
+            <p class="settings-description">Asigna teclas del teclado de la computadora o de un teclado externo a las acciones del reproductor.</p>
+            <div class="midi-learn-form keyboard-learn-form">
+              <div class="settings-field">
+                <label for="keyboard-learn-action">Acción que se aprenderá</label>
+                <select id="keyboard-learn-action">
+                  <option value="play">Reproducir / pausar</option><option value="stop">Detener</option>
+                  <option value="next">Siguiente canción</option><option value="previous">Canción anterior</option>
+                  <option value="restart">Reiniciar canción</option><option value="addMarker">Agregar punto</option>
+                  <option value="regionStart">Marcar inicio de región</option><option value="regionEnd">Marcar fin de región</option>
+                </select>
+              </div>
+              <div class="midi-learn-actions">
+                <button class="button button-primary" id="keyboard-learn-button" type="button">Iniciar Key Learn</button>
+                <button class="button button-secondary" id="keyboard-cancel-learn" type="button" hidden>Cancelar aprendizaje</button>
+              </div>
+            </div>
+            <p class="settings-status" id="keyboard-status" role="status" aria-live="polite">Atajos predeterminados: Espacio reproducir/pausar, flechas cambiar de canción y números 1–9 elegir posición.</p>
+            <div class="midi-mappings"><h3>Asignaciones de teclado</h3><ul id="keyboard-mappings-list" aria-label="Asignaciones de teclado"></ul></div>
           </section>
         </section>
 
@@ -389,6 +466,7 @@
                             <input id="import-song-bpm" name="bpm" type="number" min="30" max="300" inputmode="numeric" placeholder="120" required>
                             <span aria-hidden="true">BPM</span>
                           </div>
+                          <details class="section-help"><summary aria-label="Ayuda sobre la biblioteca">?</summary><p>Importa pistas con nombre, artista, tempo y tonalidad. Luego agrega cada canción al setlist abierto; quitarla de la biblioteca no borra los archivos originales.</p></details>
                         </div>
                         <div class="library-field import-field-wide">
                           <label for="import-song-key">Tonalidad (notación americana)</label>
@@ -503,11 +581,25 @@
           </div>
           <div class="song-pitch-control">
             <div class="song-pitch-heading">
-              <label for="song-pitch">Pitch global de la canción</label>
+              <label for="song-pitch">Tonalidad destino <span id="song-key-source">desde —</span></label>
               <output data-song-pitch-value for="song-pitch">0 st</output>
             </div>
-            <input id="song-pitch" class="range-input" type="range" min="-12" max="12" step="1" value="0" aria-label="Pitch de la canción para todas las pistas, en semitonos">
-            <p>Afecta a las pistas con Pitch canción activado y conserva la duración. Click y guías protegidas mantienen su tono.</p>
+            <select id="song-pitch" aria-label="Tonalidad de destino para todas las pistas">
+              <option value="">Selecciona tono objetivo</option>
+              <option value="C">C mayor</option><option value="C#">C♯ mayor</option><option value="Db">D♭ mayor</option>
+              <option value="D">D mayor</option><option value="D#">D♯ mayor</option><option value="Eb">E♭ mayor</option>
+              <option value="E">E mayor</option><option value="F">F mayor</option><option value="F#">F♯ mayor</option>
+              <option value="Gb">G♭ mayor</option><option value="G">G mayor</option><option value="G#">G♯ mayor</option>
+              <option value="Ab">A♭ mayor</option><option value="A">A mayor</option><option value="A#">A♯ mayor</option>
+              <option value="Bb">B♭ mayor</option><option value="B">B mayor</option>
+              <option value="Cm">C menor</option><option value="C#m">C♯ menor</option><option value="Dbm">D♭ menor</option>
+              <option value="Dm">D menor</option><option value="D#m">D♯ menor</option><option value="Ebm">E♭ menor</option>
+              <option value="Em">E menor</option><option value="Fm">F menor</option><option value="F#m">F♯ menor</option>
+              <option value="Gbm">G♭ menor</option><option value="Gm">G menor</option><option value="G#m">G♯ menor</option>
+              <option value="Abm">A♭ menor</option><option value="Am">A menor</option><option value="A#m">A♯ menor</option>
+              <option value="Bbm">B♭ menor</option><option value="Bm">B menor</option>
+            </select>
+            <p>Elige la tonalidad destino desde la tonalidad original. El cambio conserva la duración; click y guías protegidas mantienen su tono.</p>
           </div>
           <div class="session-detail"><span>Formato</span><strong>Multitrack</strong></div>
           <div class="session-detail"><span>Ruteo</span><strong><span class="output-indicator" aria-hidden="true"></span>Master o salida por pista</strong></div>
@@ -526,5 +618,15 @@
         </div>
       </aside>
     </div>
+    <dialog class="help-dialog" id="app-help-dialog" aria-labelledby="app-help-heading">
+      <div class="help-dialog-heading"><div><p class="eyebrow">GUÍA RÁPIDA</p><h2 id="app-help-heading">Usar Compás en vivo</h2></div><button class="button button-secondary" id="close-help-dialog" type="button">Cerrar</button></div>
+      <ul>
+        <li><strong>Setlists:</strong> ordena las canciones con ↑/↓; usa el botón Setlist actual para volver a la lista.</li>
+        <li><strong>Teclado:</strong> Espacio reproduce/pausa, las flechas recorren canciones y 1–9 selecciona su número. Puedes personalizar acciones con Key Learn.</li>
+        <li><strong>Forma de onda:</strong> haz clic para buscar, crea puntos y regiones, y activa Repetir para practicar una sección.</li>
+        <li><strong>Tonalidad:</strong> elige un tono destino. Las pistas protegidas y el click mantienen su pitch.</li>
+        <li><strong>Audio:</strong> elige dispositivo, frecuencia y búfer en Configuración. Si escuchas cortes, prueba aumentar el búfer.</li>
+      </ul>
+    </dialog>
   </body>
 </html>

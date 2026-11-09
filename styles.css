@@ -1115,3 +1115,44 @@ body.settings-active #player-view { display: none; }
   .session-detail { align-items: flex-start; }
   .session-detail strong { max-width: 68%; }
 }
+
+.current-setlist-button { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.section-help { position: relative; z-index: 4; width: fit-content; margin: 0 0 8px auto; }
+.section-help summary { display: grid; width: 21px; height: 21px; place-items: center; border: 1px solid #465044; border-radius: 50%; color: #b6c4ac; font: 11px var(--mono); cursor: pointer; list-style: none; }
+.section-help summary::-webkit-details-marker { display: none; }
+.section-help p { position: absolute; top: 24px; right: 0; width: min(290px, 80vw); padding: 11px 12px; border: 1px solid var(--line); border-radius: 7px; color: #c8d0c8; background: #1b211d; box-shadow: 0 10px 24px #0008; font-size: 10px; line-height: 1.55; }
+.waveform-edit-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin: 10px 0; }
+.waveform-edit-controls .button { min-height: 28px; padding: 0 10px; font-size: 9px; }
+.waveform-edit-controls button:disabled { opacity: .45; cursor: not-allowed; }
+#region-start-status { color: var(--accent); font-size: 9px; }
+.song-cues { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 10px; }
+.song-cues h3 { margin: 0 0 5px; color: #89948b; font: 8px var(--mono); letter-spacing: .8px; text-transform: uppercase; }
+.song-cues ul { display: flex; min-height: 28px; flex-wrap: wrap; gap: 5px; padding: 0; margin: 0; list-style: none; }
+.song-cues li { display: flex; min-width: 0; align-items: center; gap: 3px; padding: 3px 4px; border: 1px solid #303a32; border-radius: 5px; background: #171d19; }
+.song-cues li button { padding: 3px 5px; border: 0; color: #b9c3ba; background: transparent; font-size: 9px; cursor: pointer; }
+.song-cues li button:hover { color: var(--accent); }
+.song-cues li button[aria-pressed="true"] { color: var(--accent); }
+.song-cues li button:last-child { color: #b78282; }
+.song-pitch-control > select { width: 100%; min-height: 34px; padding: 0 9px; margin: 8px 0 5px; border: 1px solid #374238; border-radius: 6px; color: #e2e8de; background: #171d19; font-size: 11px; }
+.audio-format-row { align-items: flex-end; }
+.audio-format-row .settings-field { flex: 1; }
+.setlist-song-reorder { display: flex; gap: 3px; }
+.setlist-song-reorder button { width: 27px; height: 27px; border: 1px solid var(--line); border-radius: 5px; color: #b7c1b8; background: #1b211d; cursor: pointer; }
+.setlist-song-reorder button:disabled { opacity: .35; cursor: default; }
+.setlist-song-reorder button:not(:disabled):hover { border-color: var(--accent); color: var(--accent); }
+.keyboard-learn-form { margin-top: 12px; }
+#keyboard-mappings-list li { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+#keyboard-mappings-list button { border: 0; color: #c18a8a; background: transparent; cursor: pointer; }
+.help-dialog { width: min(520px, calc(100vw - 28px)); max-height: min(80vh, 620px); padding: 21px; border: 1px solid #3b473d; border-radius: 12px; color: #d7dfd7; background: #171d19; box-shadow: 0 24px 80px #000b; }
+.help-dialog::backdrop { background: #080b09c9; }
+.help-dialog-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.help-dialog-heading h2 { margin: 4px 0 12px; font-size: 19px; }
+.help-dialog ul { display: grid; gap: 11px; padding-left: 18px; color: #aeb8af; font-size: 12px; line-height: 1.55; }
+.help-dialog li strong { color: #e1e9df; }
+
+@media (max-width: 760px) {
+  .current-setlist-button { max-width: 120px; min-height: 28px; padding: 0 7px; font-size: 8px; }
+  .song-cues { grid-template-columns: 1fr; }
+  .waveform-edit-controls .button { min-height: 32px; }
+  .setlist-song-reorder { flex-direction: column; }
+}

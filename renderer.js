@@ -11,10 +11,18 @@ const elements = {
   setlistAddSongs: document.querySelector('#setlist-add-songs'),
   libraryReturn: document.querySelector('.library-return'),
   activeSetlistSelect: document.querySelector('#active-setlist-select'),
+  openCurrentSetlist: document.querySelector('#open-current-setlist'),
   setlistQueueHeading: document.querySelector('[data-setlist-queue-heading]'),
   currentViewLabel: document.querySelector('[data-current-view-label]'),
   waveformCanvas: document.querySelector('#song-waveform'),
   waveformStatus: document.querySelector('#waveform-status'),
+  cueName: document.querySelector('#cue-name'),
+  addMarkerButton: document.querySelector('#add-marker-button'),
+  regionStartButton: document.querySelector('#region-start-button'),
+  regionEndButton: document.querySelector('#region-end-button'),
+  regionStartStatus: document.querySelector('#region-start-status'),
+  songMarkers: document.querySelector('#song-markers'),
+  songRegions: document.querySelector('#song-regions'),
   libraryResultsList: document.querySelector('#library-results-list'),
   libraryResultsCount: document.querySelector('#library-results-count'),
   librarySearch: document.querySelector('#library-search'),
@@ -38,8 +46,10 @@ const elements = {
   songMeta: document.querySelector('#song-meta'),
   songPitch: document.querySelector('#song-pitch'),
   songPitchValue: document.querySelector('[data-song-pitch-value]'),
+  songKeySource: document.querySelector('#song-key-source'),
   playButton: document.querySelector('#play-button'),
   stopButton: document.querySelector('#stop-button'),
+  restartButton: document.querySelector('#restart-button'),
   position: document.querySelector('#position-display'),
   progress: document.querySelector('#progress-bar'),
   duration: document.querySelector('[data-duration]'),
@@ -54,12 +64,18 @@ const elements = {
   clickBeats: document.querySelector('#click-beats'),
   clickStatus: document.querySelector('[data-click-status]'),
   settingsButton: document.querySelector('#settings-button'),
+  helpButton: document.querySelector('.help-button'),
+  moreButton: document.querySelector('.more-button'),
+  helpDialog: document.querySelector('#app-help-dialog'),
+  closeHelpDialog: document.querySelector('#close-help-dialog'),
   playerView: document.querySelector('#player-view'),
   settingsView: document.querySelector('#settings-view'),
   settingsReturnButton: document.querySelector('.settings-return'),
   mixerPanel: document.querySelector('.mixer-panel'),
   audioApiSelect: document.querySelector('#audio-api-select'),
   asioDriverSelect: document.querySelector('#asio-driver-select'),
+  audioSampleRate: document.querySelector('#audio-sample-rate'),
+  audioBufferSize: document.querySelector('#audio-buffer-size'),
   refreshAudioDevices: document.querySelector('#refresh-audio-devices'),
   audioDriverStatus: document.querySelector('#audio-driver-status'),
   asioChannelStatus: document.querySelector('#asio-channel-status'),
@@ -70,6 +86,11 @@ const elements = {
   midiCancelLearn: document.querySelector('#midi-cancel-learn'),
   midiStatus: document.querySelector('#midi-status'),
   midiMappingsList: document.querySelector('#midi-mappings-list'),
+  keyboardLearnAction: document.querySelector('#keyboard-learn-action'),
+  keyboardLearnButton: document.querySelector('#keyboard-learn-button'),
+  keyboardCancelLearn: document.querySelector('#keyboard-cancel-learn'),
+  keyboardStatus: document.querySelector('#keyboard-status'),
+  keyboardMappingsList: document.querySelector('#keyboard-mappings-list'),
   audioRouteStatus: document.querySelector('#audio-route-status')
 };
 
@@ -83,7 +104,7 @@ const state = {
   duration: 0,
   timer: null,
   saveTimer: null,
-  settings: { selectedAudioApi: 'asio', selectedAudioDevice: '', midiMappings: [] },
+  settings: { selectedAudioApi: 'asio', selectedAudioDevice: '', selectedSampleRate: 0, bufferFrames: 512, midiMappings: [], keyMappings: [] },
   audioDevices: [],
   audioPrepared: false,
   pitchRefreshTimer: null,
@@ -91,6 +112,9 @@ const state = {
   midiAccess: null,
   midiLearningAction: null,
   midiLearningInputId: null,
+  keyLearningAction: null,
+  pendingRegionStart: null,
+  loopRegionId: null,
   midiLastValues: new Map(),
   importInProgress: false,
   settingsReturnHash: '#setlists-view',
@@ -98,7 +122,8 @@ const state = {
   trackTempoAnalysis: [],
   waveformDuration: 0,
   waveformLastDraw: 0,
-  pendingSongSwitch: null
+  pendingSongSwitch: null,
+  lastCacheWarning: ''
 };
 
 if (!window.location.hash) window.location.hash = 'setlists-view';
@@ -133,12 +158,20 @@ function drawWaveform(force = false) {
   const bottom = bounds.height - 19;
   const plotWidth = Math.max(0, right - left);
   const rows = state.waveformTracks;
+  const song = selectedSong();
+  if (state.waveformDuration > 0 && song) {
+    for (const region of song.regions ?? []) {
+      const start = left + plotWidth * Math.min(1, region.start / state.waveformDuration);
+      const end = left + plotWidth * Math.min(1, region.end / state.waveformDuration);
+      context.fillStyle = region.id === state.loopRegionId ? '#c1f06b24' : '#c1f06b12';
+      context.fillRect(start, top, Math.max(1, end - start), bottom - top);
+    }
+  }
   if (!rows.length) {
     context.fillStyle = '#778178';
     context.font = '11px Segoe UI, sans-serif';
     context.textAlign = 'center';
     context.textBaseline = 'middle';
-    const song = selectedSong();
     context.fillText(song?.clickOnly
       ? 'El click no contiene pistas de audio para mostrar.'
       : 'Pulsa Reproducir para preparar el espectro de las pistas.',
@@ -195,6 +228,15 @@ function drawWaveform(force = false) {
   }
 
   if (state.waveformDuration > 0) {
+    for (const marker of song?.markers ?? []) {
+      const markerX = left + plotWidth * Math.min(1, marker.position / state.waveformDuration);
+      context.strokeStyle = '#f2c879';
+      context.lineWidth = 1;
+      context.beginPath();
+      context.moveTo(markerX, top);
+      context.lineTo(markerX, bottom);
+      context.stroke();
+    }
     const position = Math.min(state.waveformDuration, currentPosition());
     const x = left + plotWidth * position / state.waveformDuration;
     context.strokeStyle = '#f2f5ee';
@@ -240,6 +282,15 @@ function normalizeSearchText(value) {
 
 function keyLabel(key) {
   return key ? key.replace(/#/g, '♯').replace(/b/g, '♭').replace(/m$/, ' menor') : 'Tonalidad pendiente';
+}
+
+function semitonesBetweenKeys(source, target) {
+  const roots = { C: 0, 'C#': 1, Db: 1, D: 2, 'D#': 3, Eb: 3, E: 4, F: 5, 'F#': 6, Gb: 6, G: 7, 'G#': 8, Ab: 8, A: 9, 'A#': 10, Bb: 10, B: 11 };
+  if (!source || !target || source.endsWith('m') !== target.endsWith('m')) return 0;
+  const sourceRoot = source.replace(/m$/, '');
+  const targetRoot = target.replace(/m$/, '');
+  const difference = roots[targetRoot] - roots[sourceRoot];
+  return ((difference + 18) % 12) - 6;
 }
 
 function renderSongs() {
@@ -334,7 +385,20 @@ function renderSetlistDetail() {
     removeButton.dataset.removeSetlistSongId = song.id;
     removeButton.textContent = 'Quitar';
     removeButton.setAttribute('aria-label', `Quitar ${song.name} de ${setlist.name}`);
-    item.append(playButton, removeButton);
+    const reorder = document.createElement('span');
+    reorder.className = 'setlist-song-reorder';
+    for (const [direction, label, title] of [[-1, '↑', 'Subir canción'], [1, '↓', 'Bajar canción']]) {
+      const moveButton = document.createElement('button');
+      moveButton.type = 'button';
+      moveButton.dataset.moveSongId = song.id;
+      moveButton.dataset.moveDirection = String(direction);
+      moveButton.disabled = direction < 0 ? index === 0 : index === songs.length - 1;
+      moveButton.textContent = label;
+      moveButton.title = title;
+      moveButton.setAttribute('aria-label', `${title}: ${song.name}`);
+      reorder.append(moveButton);
+    }
+    item.append(playButton, reorder, removeButton);
     elements.setlistSongsList.append(item);
   });
 }
@@ -415,12 +479,17 @@ function renderLibraryResults() {
 
 function renderSetlists() {
   elements.setlistList.replaceChildren();
+  const activeSetlist = state.library.setlists.find((item) => item.id === state.activeSetlistId);
   elements.activeSetlistSelect.replaceChildren(new Option('Selecciona un setlist', ''));
   for (const setlist of state.library.setlists) {
     elements.activeSetlistSelect.add(new Option(setlist.name, setlist.id));
   }
   elements.activeSetlistSelect.value = state.activeSetlistId ?? '';
   elements.activeSetlistSelect.disabled = state.library.setlists.length === 0;
+  elements.openCurrentSetlist.disabled = !state.activeSetlistId;
+  elements.openCurrentSetlist.textContent = activeSetlist
+    ? `Setlist: ${activeSetlist.name}`
+    : 'Setlist actual';
   document.querySelector('.library-count').textContent = String(
     state.library.setlists.find((item) => item.id === state.activeSetlistId)?.songIds.length ?? 0
   );
@@ -428,7 +497,6 @@ function renderSetlists() {
   elements.createSetlistHeading.textContent = state.library.setlists.length === 0
     ? 'Crea tu primer setlist'
     : 'Crea otro setlist';
-  const activeSetlist = state.library.setlists.find((item) => item.id === state.activeSetlistId);
   elements.setlistQueueHeading.textContent = activeSetlist ? 'CANCIONES DE LA LISTA' : 'SELECCIONA UN SETLIST';
   const queueSongs = activeSetlist
     ? activeSetlist.songIds.map((id) => state.library.songs.find((song) => song.id === id)).filter(Boolean)
@@ -453,7 +521,7 @@ function renderSetlists() {
       button.setAttribute('aria-label', `Reproducir ${song.name}`);
       const order = document.createElement('span');
       order.className = 'queue-song-order';
-      order.textContent = String(index + 1).padStart(2, '0');
+      order.textContent = String(index + 1);
       const copy = document.createElement('span');
       copy.className = 'queue-song-copy';
       const title = document.createElement('strong');
@@ -530,15 +598,109 @@ function deleteSetlist(setlistId) {
   setStatus(`Setlist «${setlist.name}» eliminado. Las canciones siguen en la biblioteca.`);
 }
 
+function addSongMarker() {
+  const song = selectedSong();
+  if (!song) return;
+  const name = (elements.cueName.value.trim() || `Punto ${(song.markers ?? []).length + 1}`).slice(0, 80);
+  song.markers ??= [];
+  song.markers.push({ id: crypto.randomUUID(), name, position: currentPosition() });
+  elements.cueName.value = '';
+  renderCues();
+  drawWaveform(true);
+  scheduleSave();
+  setStatus(`Punto «${name}» guardado en ${formatTime(currentPosition())}.`);
+}
+
+function setRegionStart() {
+  if (!selectedSong()) return;
+  state.pendingRegionStart = currentPosition();
+  elements.regionStartStatus.textContent = `Inicio: ${formatTime(state.pendingRegionStart)}. Marca el fin.`;
+}
+
+function finishSongRegion() {
+  const song = selectedSong();
+  if (!song || state.pendingRegionStart === null) {
+    setStatus('Primero marca el inicio de la región.');
+    return;
+  }
+  const end = currentPosition();
+  if (end <= state.pendingRegionStart) {
+    setStatus('El final de la región debe estar después del inicio.');
+    return;
+  }
+  const cleanName = (elements.cueName.value.trim() || `Región ${(song.regions ?? []).length + 1}`).slice(0, 80);
+  song.regions ??= [];
+  const region = { id: crypto.randomUUID(), name: cleanName, start: state.pendingRegionStart, end };
+  song.regions.push(region);
+  elements.cueName.value = '';
+  state.loopRegionId = region.id;
+  state.pendingRegionStart = null;
+  elements.regionStartStatus.textContent = '';
+  renderCues();
+  drawWaveform(true);
+  scheduleSave();
+  setStatus(`Región «${cleanName}» guardada y en repetición.`);
+}
+
+function renderCues() {
+  const song = selectedSong();
+  elements.addMarkerButton.disabled = !song;
+  elements.regionStartButton.disabled = !song;
+  elements.regionEndButton.disabled = !song;
+  elements.regionStartStatus.textContent = state.pendingRegionStart === null
+    ? ''
+    : `Inicio: ${formatTime(state.pendingRegionStart)}. Marca el fin.`;
+  elements.songMarkers.replaceChildren();
+  elements.songRegions.replaceChildren();
+  if (!song) return;
+
+  for (const marker of song.markers ?? []) {
+    const item = document.createElement('li');
+    const jump = document.createElement('button');
+    jump.type = 'button';
+    jump.dataset.seekMarkerId = marker.id;
+    jump.textContent = `${marker.name} · ${formatTime(marker.position)}`;
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.dataset.removeMarkerId = marker.id;
+    remove.textContent = '×';
+    remove.setAttribute('aria-label', `Quitar punto ${marker.name}`);
+    item.append(jump, remove);
+    elements.songMarkers.append(item);
+  }
+  for (const region of song.regions ?? []) {
+    const item = document.createElement('li');
+    const jump = document.createElement('button');
+    jump.type = 'button';
+    jump.dataset.seekRegionId = region.id;
+    jump.textContent = `${region.name} · ${formatTime(region.start)}–${formatTime(region.end)}`;
+    const loop = document.createElement('button');
+    loop.type = 'button';
+    loop.dataset.loopRegionId = region.id;
+    loop.setAttribute('aria-pressed', String(state.loopRegionId === region.id));
+    loop.textContent = state.loopRegionId === region.id ? 'Repitiendo' : 'Repetir';
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.dataset.removeRegionId = region.id;
+    remove.textContent = '×';
+    remove.setAttribute('aria-label', `Quitar región ${region.name}`);
+    item.append(jump, loop, remove);
+    elements.songRegions.append(item);
+  }
+}
+
 function renderSongHeader() {
   const song = selectedSong();
   if (!song) {
+    state.pendingRegionStart = null;
+    state.loopRegionId = null;
     elements.songTitle.textContent = 'Selecciona una canción';
     elements.songMeta.textContent = 'Añade pistas a tu biblioteca para empezar';
     elements.trackCount.textContent = '—';
     elements.duration.textContent = '--:--';
     elements.progress.disabled = true;
     elements.songPitch.disabled = true;
+    elements.songKeySource.textContent = 'desde —';
     elements.clickBpm.disabled = true;
     elements.clickBeats.disabled = true;
     elements.clickBpm.value = '120';
@@ -546,16 +708,22 @@ function renderSongHeader() {
     elements.clickStatus.textContent = 'Selecciona una canción';
     elements.trackList.innerHTML = '<div class="tracks-empty"><h3>Las pistas aparecerán aquí</h3><p>Selecciona una canción de tu biblioteca para controlar cada instrumento.</p></div>';
     elements.waveformStatus.textContent = 'Selecciona una canción';
+    renderCues();
     drawWaveform(true);
     return;
   }
 
   elements.songTitle.textContent = song.name;
-  elements.songPitch.disabled = false;
+  song.pitchTargetKey ??= song.key;
+  elements.songPitch.disabled = !song.key;
+  elements.songKeySource.textContent = `desde ${keyLabel(song.key)}`;
+  for (const option of elements.songPitch.options) {
+    if (option.value) option.hidden = option.value.endsWith('m') !== song.key.endsWith('m');
+  }
   elements.clickBpm.disabled = false;
   elements.clickBeats.disabled = false;
   elements.progress.disabled = song.clickOnly;
-  elements.songPitch.value = String(song.pitchSemitones);
+  elements.songPitch.value = song.pitchTargetKey || '';
   elements.songPitchValue.value = `${song.pitchSemitones > 0 ? '+' : ''}${song.pitchSemitones} st`;
   elements.clickBpm.value = String(song.bpm);
   elements.clickBeats.value = String(song.metronome.beats);
@@ -570,6 +738,7 @@ function renderSongHeader() {
     : state.waveformTracks.length
       ? `${state.waveformTracks.length} pistas analizadas`
       : 'Se analiza al iniciar la reproducción';
+  renderCues();
   drawWaveform(true);
 }
 
@@ -705,7 +874,11 @@ function renderOutputOptions(selectedChannel) {
 
 function renderMidiMappings() {
   elements.midiMappingsList.replaceChildren();
-  const actionNames = { play: 'Reproducir', stop: 'Detener', next: 'Siguiente canción' };
+  const actionNames = {
+    play: 'Reproducir / pausar', stop: 'Detener', next: 'Siguiente canción',
+    previous: 'Canción anterior', restart: 'Reiniciar canción', addMarker: 'Agregar punto',
+    regionStart: 'Marcar inicio de región', regionEnd: 'Marcar fin de región'
+  };
   for (const mapping of state.settings.midiMappings) {
     const item = document.createElement('li');
     const message = mapping.messageType === 'note' ? 'Nota' : 'CC';
@@ -726,10 +899,46 @@ function renderMidiMappings() {
   }
 }
 
+function renderKeyboardMappings() {
+  elements.keyboardMappingsList.replaceChildren();
+  const actionNames = {
+    play: 'Reproducir / pausar', stop: 'Detener', next: 'Siguiente canción',
+    previous: 'Canción anterior', restart: 'Reiniciar canción', addMarker: 'Agregar punto',
+    regionStart: 'Marcar inicio de región', regionEnd: 'Marcar fin de región'
+  };
+  for (const mapping of state.settings.keyMappings) {
+    const item = document.createElement('li');
+    const description = document.createElement('span');
+    const modifiers = [mapping.ctrl && 'Ctrl', mapping.alt && 'Alt', mapping.shift && 'Mayús'].filter(Boolean);
+    description.textContent = `${actionNames[mapping.action]} · ${[...modifiers, mapping.code].join(' + ')}`;
+    const removeButton = document.createElement('button');
+    removeButton.type = 'button';
+    removeButton.dataset.keyRemoveAction = mapping.action;
+    removeButton.textContent = 'Quitar';
+    removeButton.setAttribute('aria-label', `Quitar asignación de ${actionNames[mapping.action]}`);
+    item.append(description, removeButton);
+    elements.keyboardMappingsList.append(item);
+  }
+  if (state.settings.keyMappings.length === 0) {
+    const item = document.createElement('li');
+    item.textContent = 'Todavía no hay asignaciones personalizadas.';
+    elements.keyboardMappingsList.append(item);
+  }
+}
+
 async function persistSettings() {
   try {
-    state.settings = await window.multitracks.saveSettings(state.settings);
+    const savedSettings = await window.multitracks.saveSettings(state.settings);
+    state.settings = {
+      ...state.settings,
+      ...savedSettings,
+      selectedSampleRate: Number(savedSettings?.selectedSampleRate ?? state.settings.selectedSampleRate) || 0,
+      bufferFrames: Number(savedSettings?.bufferFrames ?? state.settings.bufferFrames) || 512,
+      midiMappings: Array.isArray(savedSettings?.midiMappings) ? savedSettings.midiMappings : state.settings.midiMappings,
+      keyMappings: Array.isArray(savedSettings?.keyMappings) ? savedSettings.keyMappings : state.settings.keyMappings
+    };
     renderMidiMappings();
+    renderKeyboardMappings();
   } catch (error) {
     setStatus(`No se pudo guardar la configuración: ${error.message}`);
     elements.midiStatus.textContent = `No se pudo guardar: ${error.message}`;
@@ -754,11 +963,22 @@ async function refreshAsioDrivers() {
     }
     elements.asioDriverSelect.value = state.settings.selectedAudioDevice;
     const device = devices.find((item) => String(item.id) === state.settings.selectedAudioDevice);
+    const supportedRates = [...new Set((device?.sampleRates ?? []).filter((rate) => [44100, 48000, 88200, 96000].includes(rate)))];
+    if (device && supportedRates.length === 0) supportedRates.push(device.sampleRate);
+    elements.audioSampleRate.replaceChildren(new Option('Predeterminada del dispositivo', '0'));
+    for (const rate of supportedRates) {
+      elements.audioSampleRate.add(new Option(`${rate / 1000} kHz`, String(rate)));
+    }
+    if (state.settings.selectedSampleRate && !supportedRates.includes(state.settings.selectedSampleRate)) {
+      state.settings.selectedSampleRate = 0;
+    }
+    elements.audioSampleRate.value = String(state.settings.selectedSampleRate);
+    elements.audioBufferSize.value = String(state.settings.bufferFrames);
     elements.audioDriverStatus.textContent = devices.length > 0
       ? `${devices.length} dispositivo(s) ${api.toUpperCase()} disponible(s).`
       : `No se encontraron dispositivos ${api.toUpperCase()} de salida.`;
     elements.asioChannelStatus.textContent = device
-      ? `${device.name}: ${device.outputChannels} salidas · ${device.sampleRate} Hz.`
+      ? `${device.name}: ${device.outputChannels} salidas · ${state.settings.selectedSampleRate || device.sampleRate} Hz · búfer ${state.settings.bufferFrames} muestras.`
       : 'Selecciona un dispositivo con salidas disponibles.';
     elements.audioRouteStatus.textContent = device
       ? 'El ruteo por pista ya está disponible: master estéreo, mono o par estéreo.'
@@ -799,15 +1019,34 @@ function executeMidiAction(action) {
     elements.stopButton.click();
     return;
   }
+  if (action === 'next' || action === 'previous') {
+    navigateSetlist(action === 'next' ? 1 : -1);
+    return;
+  }
+  if (action === 'restart') {
+    restartPlayback();
+    return;
+  }
+  if (action === 'addMarker') addSongMarker();
+  else if (action === 'regionStart') setRegionStart();
+  else if (action === 'regionEnd') finishSongRegion();
+}
 
-  const songIds = state.library.setlists.find((setlist) => setlist.id === state.activeSetlistId)?.songIds ?? [];
+function navigateSetlist(direction) {
+  const songIds = activeSetlist()?.songIds ?? [];
   const currentIndex = songIds.indexOf(state.selectedSongId);
-  const nextId = songIds[currentIndex + 1];
+  const nextId = songIds[currentIndex + direction];
   if (!nextId) {
-    setStatus('No hay otra canción en la lista actual.');
+    setStatus(direction > 0 ? 'No hay otra canción en la lista actual.' : 'Ya estás al inicio del setlist.');
     return;
   }
   chooseSong(nextId);
+}
+
+function chooseSongByNumber(number) {
+  const songId = activeSetlist()?.songIds[number - 1];
+  if (songId) chooseSong(songId);
+  else setStatus(`No hay una canción asignada al número ${number} en este setlist.`);
 }
 
 function handleMidiMessage(input, event) {
@@ -972,6 +1211,11 @@ function updateTimeline() {
   elements.waveformCanvas.setAttribute('aria-valuenow', String(Math.min(position, maxPosition)));
   elements.waveformCanvas.setAttribute('aria-valuetext', formatTime(position));
   drawWaveform();
+  const loopRegion = selectedSong()?.regions?.find((region) => region.id === state.loopRegionId);
+  if (state.isPlaying && loopRegion && position >= loopRegion.end) {
+    seekFromWaveform(loopRegion.start);
+    return;
+  }
   if (state.isPlaying && !song?.clickOnly && state.duration > 0 && position >= state.duration) {
     state.offset = 0;
     state.isPlaying = false;
@@ -1059,6 +1303,24 @@ function pausePlayback() {
   setStatus('Reproducción pausada.');
 }
 
+async function restartPlayback() {
+  if (!selectedSong()) return;
+  if (!state.audioPrepared) {
+    state.offset = 0;
+    updateTimeline();
+    return;
+  }
+  const shouldResume = state.isPlaying;
+  await window.multitracks.audioCommand({ action: 'seek', positionFrames: 0 });
+  state.offset = 0;
+  state.startedAt = performance.now() / 1000;
+  state.isPlaying = shouldResume;
+  if (shouldResume) startPlaybackStatusTimer();
+  setTransportButton(shouldResume);
+  updateTimeline();
+  setStatus('Canción reiniciada.');
+}
+
 function stopPlayback() {
   state.isPlaying = false;
   state.pendingSongSwitch = null;
@@ -1127,6 +1389,8 @@ async function chooseSong(songId) {
   state.waveformTracks = [];
   state.trackTempoAnalysis = [];
   state.waveformDuration = 0;
+  state.pendingRegionStart = null;
+  state.loopRegionId = null;
   elements.position.textContent = '00:00';
   elements.progress.value = '0';
   renderAll();
@@ -1183,6 +1447,17 @@ function addSongToSetlist(songId) {
   scheduleSave();
   const song = state.library.songs.find((item) => item.id === songId);
   setStatus(`«${song?.name ?? 'Canción'}» añadida a «${setlist.name}».`);
+}
+
+function moveSongInSetlist(songId, direction) {
+  const setlist = activeSetlist();
+  if (!setlist) return;
+  const index = setlist.songIds.indexOf(songId);
+  const nextIndex = index + direction;
+  if (index < 0 || nextIndex < 0 || nextIndex >= setlist.songIds.length) return;
+  [setlist.songIds[index], setlist.songIds[nextIndex]] = [setlist.songIds[nextIndex], setlist.songIds[index]];
+  renderSetlists();
+  scheduleSave();
 }
 
 async function importSongFromForm(event) {
@@ -1280,6 +1555,10 @@ elements.activeSetlistSelect.addEventListener('change', () => {
   if (elements.activeSetlistSelect.value) openSetlist(elements.activeSetlistSelect.value);
 });
 
+elements.openCurrentSetlist.addEventListener('click', () => {
+  if (state.activeSetlistId) openSetlist(state.activeSetlistId);
+});
+
 elements.setlistCards.addEventListener('click', (event) => {
   const removeButton = event.target.closest('[data-delete-setlist-id]');
   if (removeButton) {
@@ -1291,6 +1570,11 @@ elements.setlistCards.addEventListener('click', (event) => {
 });
 
 elements.setlistSongsList.addEventListener('click', (event) => {
+  const moveButton = event.target.closest('[data-move-song-id]');
+  if (moveButton) {
+    moveSongInSetlist(moveButton.dataset.moveSongId, Number(moveButton.dataset.moveDirection));
+    return;
+  }
   const removeButton = event.target.closest('[data-remove-setlist-song-id]');
   if (removeButton) {
     const setlist = state.library.setlists.find((item) => item.id === state.activeSetlistId);
@@ -1443,6 +1727,9 @@ elements.playButton.addEventListener('click', async () => {
 });
 
 elements.stopButton.addEventListener('click', stopPlayback);
+elements.restartButton.addEventListener('click', () => {
+  restartPlayback().catch((error) => setStatus(`No se pudo reiniciar la canción: ${error.message}`));
+});
 
 elements.progress.addEventListener('input', () => {
   elements.position.textContent = formatTime(Number(elements.progress.value));
@@ -1456,7 +1743,9 @@ elements.progress.addEventListener('change', () => {
   window.clearInterval(state.timer);
   state.timer = null;
   if (state.audioPrepared) {
-    const sampleRate = state.audioDevices.find((device) => String(device.id) === state.settings.selectedAudioDevice)?.sampleRate ?? 48000;
+    const sampleRate = state.settings.selectedSampleRate
+      || state.audioDevices.find((device) => String(device.id) === state.settings.selectedAudioDevice)?.sampleRate
+      || 48000;
     window.multitracks.audioCommand({
       action: 'seek',
       positionFrames: Math.round(nextPosition * sampleRate)
@@ -1499,6 +1788,48 @@ elements.waveformCanvas.addEventListener('keydown', (event) => {
   seekFromWaveform(position);
 });
 
+elements.addMarkerButton.addEventListener('click', addSongMarker);
+elements.regionStartButton.addEventListener('click', setRegionStart);
+elements.regionEndButton.addEventListener('click', finishSongRegion);
+
+elements.songMarkers.addEventListener('click', (event) => {
+  const seekButton = event.target.closest('[data-seek-marker-id]');
+  const removeButton = event.target.closest('[data-remove-marker-id]');
+  const song = selectedSong();
+  if (!song) return;
+  if (seekButton) {
+    const marker = song.markers.find((item) => item.id === seekButton.dataset.seekMarkerId);
+    if (marker) seekFromWaveform(marker.position);
+  } else if (removeButton) {
+    song.markers = song.markers.filter((item) => item.id !== removeButton.dataset.removeMarkerId);
+    renderCues();
+    drawWaveform(true);
+    scheduleSave();
+  }
+});
+
+elements.songRegions.addEventListener('click', (event) => {
+  const seekButton = event.target.closest('[data-seek-region-id]');
+  const loopButton = event.target.closest('[data-loop-region-id]');
+  const removeButton = event.target.closest('[data-remove-region-id]');
+  const song = selectedSong();
+  if (!song) return;
+  if (seekButton) {
+    const region = song.regions.find((item) => item.id === seekButton.dataset.seekRegionId);
+    if (region) seekFromWaveform(region.start);
+  } else if (loopButton) {
+    state.loopRegionId = state.loopRegionId === loopButton.dataset.loopRegionId ? null : loopButton.dataset.loopRegionId;
+    renderCues();
+    drawWaveform(true);
+  } else if (removeButton) {
+    song.regions = song.regions.filter((item) => item.id !== removeButton.dataset.removeRegionId);
+    if (state.loopRegionId === removeButton.dataset.removeRegionId) state.loopRegionId = null;
+    renderCues();
+    drawWaveform(true);
+    scheduleSave();
+  }
+});
+
 elements.masterVolume.addEventListener('input', () => {
   const value = Number(elements.masterVolume.value);
   elements.masterVolumeValue.value = `${value}%`;
@@ -1535,10 +1866,11 @@ function reprocessPitchSettings() {
   }, 350);
 }
 
-elements.songPitch.addEventListener('input', () => {
+elements.songPitch.addEventListener('change', () => {
   const song = selectedSong();
-  if (!song) return;
-  song.pitchSemitones = Number(elements.songPitch.value);
+  if (!song || !song.key) return;
+  song.pitchTargetKey = elements.songPitch.value || song.key;
+  song.pitchSemitones = semitonesBetweenKeys(song.key, song.pitchTargetKey);
   elements.songPitchValue.value = `${song.pitchSemitones > 0 ? '+' : ''}${song.pitchSemitones} st`;
   updateSongDuration();
   scheduleSave();
@@ -1578,6 +1910,7 @@ async function showSettingsView(showSettings) {
   if (!showSettings) document.body.classList.remove('settings-active');
   if (showSettings) {
     renderMidiMappings();
+    renderKeyboardMappings();
     await refreshAsioDrivers();
   }
 }
@@ -1587,6 +1920,14 @@ elements.settingsButton.addEventListener('click', (event) => {
   state.settingsReturnHash = window.location.hash || '#setlists-view';
   showSettingsView(true);
 });
+
+function showAppHelp() {
+  if (!elements.helpDialog.open) elements.helpDialog.showModal();
+}
+
+elements.helpButton.addEventListener('click', showAppHelp);
+elements.moreButton.addEventListener('click', showAppHelp);
+elements.closeHelpDialog.addEventListener('click', () => elements.helpDialog.close());
 
 elements.settingsReturnButton.addEventListener('click', (event) => {
   event.preventDefault();
@@ -1608,6 +1949,7 @@ elements.audioApiSelect.addEventListener('change', async () => {
   if (wasPrepared || state.isPlaying) stopPlayback();
   state.settings.selectedAudioApi = elements.audioApiSelect.value;
   state.settings.selectedAudioDevice = '';
+  state.settings.selectedSampleRate = 0;
   await persistSettings();
   await refreshAsioDrivers();
 });
@@ -1618,9 +1960,34 @@ elements.asioDriverSelect.addEventListener('change', async () => {
   persistSettings();
   const device = state.audioDevices.find((item) => String(item.id) === state.settings.selectedAudioDevice);
   elements.asioChannelStatus.textContent = device
-    ? `${device.name}: ${device.outputChannels} salidas · ${device.sampleRate} Hz.`
+    ? `${device.name}: ${device.outputChannels} salidas · ${state.settings.selectedSampleRate || device.sampleRate} Hz · búfer ${state.settings.bufferFrames} muestras.`
     : 'Selecciona un dispositivo con salidas disponibles.';
   renderTracks();
+});
+
+elements.audioSampleRate.addEventListener('change', () => {
+  const sampleRate = Number(elements.audioSampleRate.value);
+  const device = state.audioDevices.find((item) => String(item.id) === state.settings.selectedAudioDevice);
+  const supported = device && (sampleRate === 0 || (device.sampleRates ?? [device.sampleRate]).includes(sampleRate));
+  if (!supported) {
+    elements.audioDriverStatus.textContent = 'La frecuencia seleccionada no está disponible en este dispositivo.';
+    elements.audioSampleRate.value = String(state.settings.selectedSampleRate);
+    return;
+  }
+  if (state.audioPrepared || state.isPlaying) stopPlayback();
+  state.settings.selectedSampleRate = sampleRate;
+  elements.asioChannelStatus.textContent = `${device.name}: ${device.outputChannels} salidas · ${sampleRate || device.sampleRate} Hz · búfer ${state.settings.bufferFrames} muestras.`;
+  persistSettings();
+});
+
+elements.audioBufferSize.addEventListener('change', () => {
+  if (state.audioPrepared || state.isPlaying) stopPlayback();
+  state.settings.bufferFrames = Number(elements.audioBufferSize.value);
+  const device = state.audioDevices.find((item) => String(item.id) === state.settings.selectedAudioDevice);
+  if (device) {
+    elements.asioChannelStatus.textContent = `${device.name}: ${device.outputChannels} salidas · ${state.settings.selectedSampleRate || device.sampleRate} Hz · búfer ${state.settings.bufferFrames} muestras.`;
+  }
+  persistSettings();
 });
 
 elements.midiEnableButton.addEventListener('click', enableMidi);
@@ -1669,13 +2036,92 @@ elements.midiMappingsList.addEventListener('click', (event) => {
   persistSettings();
 });
 
+elements.keyboardLearnButton.addEventListener('click', () => {
+  state.keyLearningAction = elements.keyboardLearnAction.value;
+  elements.keyboardLearnButton.disabled = true;
+  elements.keyboardCancelLearn.hidden = false;
+  elements.keyboardStatus.textContent = `Pulsa ahora la tecla que quieres asignar a «${elements.keyboardLearnAction.selectedOptions[0].textContent}».`;
+});
+
+elements.keyboardCancelLearn.addEventListener('click', () => {
+  state.keyLearningAction = null;
+  elements.keyboardLearnButton.disabled = false;
+  elements.keyboardCancelLearn.hidden = true;
+  elements.keyboardStatus.textContent = 'Aprendizaje de teclado cancelado.';
+});
+
+elements.keyboardMappingsList.addEventListener('click', (event) => {
+  const removeButton = event.target.closest('[data-key-remove-action]');
+  if (!removeButton) return;
+  state.settings.keyMappings = state.settings.keyMappings.filter((mapping) => mapping.action !== removeButton.dataset.keyRemoveAction);
+  renderKeyboardMappings();
+  persistSettings();
+});
+
 window.addEventListener('keydown', (event) => {
-  if (event.code !== 'Space' || event.repeat || (event.target instanceof Element && event.target.matches('input, textarea, select, button'))) return;
-  event.preventDefault();
-  elements.playButton.click();
+  if (state.keyLearningAction) {
+    if (['ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'ShiftLeft', 'ShiftRight', 'MetaLeft', 'MetaRight'].includes(event.code)) return;
+    event.preventDefault();
+    if (!/^(?:Key[A-Z]|Digit[0-9]|Numpad[0-9]|Space|Arrow(?:Up|Down|Left|Right)|Home|End|Enter|Escape|F(?:[1-9]|1[0-2]))$/.test(event.code)) {
+      state.keyLearningAction = null;
+      elements.keyboardLearnButton.disabled = false;
+      elements.keyboardCancelLearn.hidden = true;
+      elements.keyboardStatus.textContent = 'Esa tecla no se puede asignar; prueba con letras, números, flechas o teclas F.';
+      return;
+    }
+    const mapping = {
+      action: state.keyLearningAction,
+      code: event.code,
+      ctrl: event.ctrlKey,
+      alt: event.altKey,
+      shift: event.shiftKey
+    };
+    state.settings.keyMappings = [
+      ...state.settings.keyMappings.filter((item) => item.action !== mapping.action
+        && !(item.code === mapping.code && item.ctrl === mapping.ctrl && item.alt === mapping.alt && item.shift === mapping.shift)),
+      mapping
+    ];
+    state.keyLearningAction = null;
+    elements.keyboardLearnButton.disabled = false;
+    elements.keyboardCancelLearn.hidden = true;
+    elements.keyboardStatus.textContent = `Tecla ${[mapping.ctrl && 'Ctrl', mapping.alt && 'Alt', mapping.shift && 'Mayús', mapping.code].filter(Boolean).join(' + ')} asignada.`;
+    renderKeyboardMappings();
+    persistSettings();
+    return;
+  }
+  if (event.defaultPrevented || event.repeat
+    || (event.target instanceof Element && event.target.matches('input, textarea, select, [contenteditable="true"]'))) return;
+  const mapping = state.settings.keyMappings.find((item) => item.code === event.code
+    && item.ctrl === event.ctrlKey && item.alt === event.altKey && item.shift === event.shiftKey);
+  if (mapping) {
+    event.preventDefault();
+    executeMidiAction(mapping.action);
+    return;
+  }
+  if (event.ctrlKey || event.altKey || event.metaKey) return;
+  if (event.code === 'Space') {
+    event.preventDefault();
+    elements.playButton.click();
+  } else if (event.code === 'ArrowRight' || event.code === 'ArrowDown') {
+    event.preventDefault();
+    navigateSetlist(1);
+  } else if (event.code === 'ArrowLeft' || event.code === 'ArrowUp') {
+    event.preventDefault();
+    navigateSetlist(-1);
+  } else if (/^(?:Digit|Numpad)[1-9]$/.test(event.code)) {
+    event.preventDefault();
+    chooseSongByNumber(Number(event.code.slice(-1)));
+  }
 });
 
 window.multitracks.onAudioEvent((event) => {
+  if (event.event === 'cache-warning') {
+    if (!event.songId || event.songId === selectedSong()?.id) {
+      state.lastCacheWarning = event.message;
+      setStatus(event.message);
+    }
+    return;
+  }
   if (event.event === 'preparing') {
     if (event.songId && event.songId !== selectedSong()?.id) return;
     setStatus(`Preparando «${event.track}» y ajustando el pitch…`);
@@ -1703,10 +2149,11 @@ window.multitracks.onAudioEvent((event) => {
         && Number.isFinite(track.confidence)
         && typeof track.synced === 'boolean')
       : [];
+    const cachedTracks = Number(event.cachedTracks) || 0;
     elements.waveformStatus.textContent = song?.clickOnly
       ? 'Canción solo con click'
       : state.waveformTracks.length
-        ? `${state.waveformTracks.length} pistas analizadas · ${state.trackTempoAnalysis.filter((track) => track.synced).length} sincronizadas`
+        ? `${cachedTracks ? `${cachedTracks} desde caché · ` : ''}${state.waveformTracks.length} pistas analizadas · ${state.trackTempoAnalysis.filter((track) => track.synced).length} sincronizadas`
         : 'No se pudo analizar el espectro';
     state.offset = Number(event.positionFrames ?? 0) / sampleRate;
     state.startedAt = performance.now() / 1000;
@@ -1715,9 +2162,12 @@ window.multitracks.onAudioEvent((event) => {
     renderTracks();
     setTransportButton(true);
     updateSongDuration();
-    setStatus(song?.clickOnly
+    setStatus(state.lastCacheWarning || (song?.clickOnly
       ? 'Reproduciendo click. Pulsa Detener para terminar.'
-      : `Reproduciendo por ${state.settings.selectedAudioApi.toUpperCase()}.`);
+      : cachedTracks
+        ? `${cachedTracks} pistas cargadas desde caché. Reproduciendo por ${state.settings.selectedAudioApi.toUpperCase()}.`
+        : `Reproduciendo por ${state.settings.selectedAudioApi.toUpperCase()}.`));
+    state.lastCacheWarning = '';
     drawWaveform(true);
     return;
   }
@@ -1789,9 +2239,18 @@ window.multitracks.loadLibrary().then((library) => {
   return window.multitracks.loadSettings();
 }).then((loadedSettings) => {
   if (!loadedSettings) return;
-  state.settings = loadedSettings;
+  state.settings = {
+    ...state.settings,
+    ...loadedSettings,
+    selectedSampleRate: Number(loadedSettings.selectedSampleRate) || 0,
+    bufferFrames: Number(loadedSettings.bufferFrames) || 512,
+    midiMappings: Array.isArray(loadedSettings.midiMappings) ? loadedSettings.midiMappings : [],
+    keyMappings: Array.isArray(loadedSettings.keyMappings) ? loadedSettings.keyMappings : []
+  };
   elements.audioApiSelect.value = state.settings.selectedAudioApi;
+  elements.audioBufferSize.value = String(state.settings.bufferFrames);
   renderMidiMappings();
+  renderKeyboardMappings();
   return refreshAsioDrivers();
 }).catch((error) => {
   setStatus(`No se pudieron cargar la biblioteca y la configuración: ${error.message}`);

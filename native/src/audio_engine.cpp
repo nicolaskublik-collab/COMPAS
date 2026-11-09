@@ -15,6 +15,7 @@
 #include <climits>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -35,6 +36,9 @@ struct AudioTrack {
   double analyzedBpm{0.0};
   double tempoConfidence{0.0};
   bool tempoSynced{false};
+  std::vector<float> waveform;
+  bool cacheHit{false};
+  std::string cacheWarning;
   std::atomic<float> volume{1.0F};
   std::atomic<float> pan{0.0F};
   std::atomic<int> outputChannel{-1};
@@ -42,9 +46,25 @@ struct AudioTrack {
 
 using TrackSet = std::vector<std::shared_ptr<AudioTrack>>;
 
+struct TransitionDeck {
+  std::shared_ptr<const TrackSet> tracks;
+  std::atomic<uint64_t> position{0};
+  uint64_t duration{0};
+  float masterVolume{1.0F};
+  float setlistVolume{1.0F};
+  float clickVolume{0.0F};
+  bool clickEnabled{false};
+  int clickOutputChannel{-1};
+  double clickBpm{120.0};
+  int clickBeats{4};
+  unsigned int sampleRate{kSampleRate};
+  std::atomic<uint64_t> fadeRemaining{0};
+};
+
 struct AudioEngine {
   std::shared_ptr<const TrackSet> tracks{std::make_shared<const TrackSet>()};
   std::vector<std::shared_ptr<const TrackSet>> retiredTrackSets;
+  std::shared_ptr<TransitionDeck> transition;
   std::unique_ptr<RtAudio> audio;
   std::string api;
   unsigned int deviceId{0};
@@ -62,6 +82,8 @@ struct AudioEngine {
   std::atomic<bool> clickEnabled{false};
   unsigned int outputChannels{2};
   unsigned int sampleRate{kSampleRate};
+  unsigned int bufferFrames{512};
+  unsigned int requestedSampleRate{0};
 };
 
 std::mutex outputMutex;
@@ -100,6 +122,7 @@ json listDevices(const std::string& apiString) {
       {"api", apiName(api)},
       {"outputChannels", info.outputChannels},
       {"sampleRate", info.preferredSampleRate == 0 ? kSampleRate : info.preferredSampleRate},
+      {"sampleRates", info.sampleRates},
       {"isDefault", info.isDefaultOutput}
     });
   }
@@ -300,6 +323,49 @@ int routedChannelCount(int route) {
   return 2;
 }
 
+void mixTrackFrame(float* output, unsigned int outputChannels, const AudioTrack& track,
+                   uint64_t frame, float gain) {
+  const size_t sourceIndex = static_cast<size_t>(frame) * kChannels;
+  if (sourceIndex + 1 >= track.samples.size()) return;
+  const float left = track.samples[sourceIndex];
+  const float right = track.samples[sourceIndex + 1];
+  const int route = track.outputChannel.load();
+  if (route >= 0) {
+    if (static_cast<unsigned int>(route) < outputChannels) {
+      output[route] += (left + right) * 0.5F * gain;
+    }
+  } else if (route <= -2) {
+    const unsigned int firstChannel = static_cast<unsigned int>(-route - 2);
+    if (firstChannel + 1 < outputChannels) {
+      output[firstChannel] += left * gain;
+      output[firstChannel + 1] += right * gain;
+    }
+  } else if (outputChannels >= 2) {
+    const float pan = std::clamp(track.pan.load(), -1.0F, 1.0F);
+    const float leftGain = pan > 0.0F ? 1.0F - pan : 1.0F;
+    const float rightGain = pan < 0.0F ? 1.0F + pan : 1.0F;
+    output[0] += left * leftGain * gain;
+    output[1] += right * rightGain * gain;
+  }
+}
+
+float clickSample(uint64_t frame, unsigned int sampleRate, double bpm, int beats, float volume) {
+  const double beatFrames = static_cast<double>(sampleRate) * 60.0 / bpm;
+  const auto beat = static_cast<uint64_t>(static_cast<double>(frame) / beatFrames);
+  const double beatPosition = static_cast<double>(frame) - static_cast<double>(beat) * beatFrames;
+  if (beatPosition >= sampleRate * 0.035) return 0.0F;
+  const float accent = beat % static_cast<uint64_t>(std::max(1, beats)) == 0 ? 1.0F : 0.65F;
+  const float envelope = static_cast<float>(1.0 - beatPosition / (sampleRate * 0.035));
+  const double frequency = accent > 0.9F ? 1560.0 : 1040.0;
+  return static_cast<float>(std::sin(6.283185307179586 * frequency * beatPosition / sampleRate))
+    * envelope * volume * accent * 0.65F;
+}
+
+float transitionFadeGain(uint64_t remaining, uint64_t frameOffset, uint64_t total) {
+  if (remaining <= frameOffset) return 0.0F;
+  return static_cast<float>(remaining - frameOffset) / static_cast<float>(std::max<uint64_t>(1, total));
+}
+
 json testPitchProtection() {
   AudioTrack testTrack;
   testTrack.pitchEnabled = false;
@@ -349,50 +415,230 @@ json testClickRouting() {
   return {{"passed", monoPassed && stereoPassed && masterPassed}};
 }
 
+constexpr size_t kWaveformBins = 1024;
+constexpr char kCacheMagic[] = "COMPAS01";
+
+struct TrackCacheHeader {
+  char magic[8]{};
+  char key[65]{};
+  uint32_t sampleRate{0};
+  uint32_t waveformBins{0};
+  double analyzedBpm{0.0};
+  double tempoConfidence{0.0};
+  uint64_t frameCount{0};
+};
+
+std::vector<float> makeWaveform(const std::vector<float>& samples) {
+  std::vector<double> powers(kWaveformBins, 0.0);
+  std::vector<uint64_t> counts(kWaveformBins, 0);
+  const size_t frameCount = samples.size() / kChannels;
+  for (size_t frame = 0; frame < frameCount; ++frame) {
+    const size_t bin = std::min(kWaveformBins - 1, frame * kWaveformBins / frameCount);
+    const double left = samples[frame * kChannels];
+    const double right = samples[frame * kChannels + 1];
+    powers[bin] += (left * left + right * right) * 0.5;
+    ++counts[bin];
+  }
+  double peakPower = 0.0;
+  for (size_t bin = 0; bin < kWaveformBins; ++bin) {
+    if (counts[bin] != 0) powers[bin] /= static_cast<double>(counts[bin]);
+    peakPower = std::max(peakPower, powers[bin]);
+  }
+  std::vector<float> values(kWaveformBins, 0.0F);
+  for (size_t bin = 0; bin < kWaveformBins; ++bin) {
+    values[bin] = peakPower > 0.0 ? static_cast<float>(powers[bin] / peakPower) : 0.0F;
+  }
+  return values;
+}
+
+bool readTrackCache(AudioTrack& track, const std::string& cacheDirectory, const std::string& cacheKey,
+                    unsigned int sampleRate) {
+  if (cacheDirectory.empty() || cacheKey.size() != 64) return false;
+  const std::filesystem::path cachePath = std::filesystem::u8path(cacheDirectory)
+    / (cacheKey + ".cmpcache");
+  std::error_code fileError;
+  if (!std::filesystem::exists(cachePath, fileError)) {
+    if (fileError) track.cacheWarning = "No se pudo consultar la caché: " + fileError.message();
+    return false;
+  }
+  std::ifstream input(cachePath, std::ios::binary);
+  TrackCacheHeader header{};
+  if (!input.read(reinterpret_cast<char*>(&header), sizeof(header))
+      || std::string(header.magic, sizeof(header.magic)) != kCacheMagic
+      || std::string(header.key) != cacheKey
+      || header.sampleRate != sampleRate
+      || header.waveformBins != kWaveformBins
+      || !std::isfinite(header.analyzedBpm) || header.analyzedBpm < 0.0
+      || !std::isfinite(header.tempoConfidence) || header.tempoConfidence < 0.0 || header.tempoConfidence > 1.0
+      || header.frameCount == 0
+      || header.frameCount > static_cast<uint64_t>(INT_MAX / kChannels)) {
+    track.cacheWarning = "La caché de «" + track.name + "» no es válida; se analizará de nuevo.";
+    return false;
+  }
+  track.waveform.resize(header.waveformBins);
+  track.samples.resize(static_cast<size_t>(header.frameCount) * kChannels);
+  if (!input.read(reinterpret_cast<char*>(track.waveform.data()),
+                  static_cast<std::streamsize>(track.waveform.size() * sizeof(float)))
+      || !input.read(reinterpret_cast<char*>(track.samples.data()),
+                     static_cast<std::streamsize>(track.samples.size() * sizeof(float)))) {
+    track.waveform.clear();
+    track.samples.clear();
+    track.cacheWarning = "La caché de «" + track.name + "» está incompleta; se analizará de nuevo.";
+    return false;
+  }
+  if (std::any_of(track.waveform.begin(), track.waveform.end(), [](float value) {
+        return !std::isfinite(value) || value < 0.0F || value > 1.0F;
+      })
+      || std::any_of(track.samples.begin(), track.samples.end(), [](float value) {
+        return !std::isfinite(value);
+      })) {
+    track.waveform.clear();
+    track.samples.clear();
+    track.cacheWarning = "La caché de «" + track.name + "» contiene datos inválidos; se analizará de nuevo.";
+    return false;
+  }
+  track.analyzedBpm = header.analyzedBpm;
+  track.tempoConfidence = header.tempoConfidence;
+  track.cacheHit = true;
+  return true;
+}
+
+void writeTrackCache(const AudioTrack& track, const std::string& cacheDirectory,
+                     const std::string& cacheKey, unsigned int sampleRate,
+                     std::string& warning) {
+  if (cacheDirectory.empty() || cacheKey.size() != 64 || track.samples.empty()) return;
+  const std::filesystem::path directory = std::filesystem::u8path(cacheDirectory);
+  const std::filesystem::path cachePath = directory / (cacheKey + ".cmpcache");
+  const std::filesystem::path temporaryPath = directory / (cacheKey + ".tmp");
+  std::error_code fileError;
+  std::filesystem::create_directories(directory, fileError);
+  if (fileError) {
+    warning = "No se pudo crear la caché de análisis: " + fileError.message();
+    return;
+  }
+  TrackCacheHeader header{};
+  std::copy(std::begin(kCacheMagic), std::end(kCacheMagic) - 1, header.magic);
+  std::copy(cacheKey.begin(), cacheKey.end(), header.key);
+  header.sampleRate = sampleRate;
+  header.waveformBins = static_cast<uint32_t>(track.waveform.size());
+  header.analyzedBpm = track.analyzedBpm;
+  header.tempoConfidence = track.tempoConfidence;
+  header.frameCount = track.samples.size() / kChannels;
+
+  {
+    std::ofstream output(temporaryPath, std::ios::binary | std::ios::trunc);
+    if (!output
+        || !output.write(reinterpret_cast<const char*>(&header), sizeof(header))
+        || !output.write(reinterpret_cast<const char*>(track.waveform.data()),
+                         static_cast<std::streamsize>(track.waveform.size() * sizeof(float)))
+        || !output.write(reinterpret_cast<const char*>(track.samples.data()),
+                         static_cast<std::streamsize>(track.samples.size() * sizeof(float)))
+        || !output.flush()) {
+      warning = "No se pudo guardar la caché de «" + track.name + "».";
+      output.close();
+      std::filesystem::remove(temporaryPath, fileError);
+      return;
+    }
+  }
+  std::filesystem::remove(cachePath, fileError);
+  fileError.clear();
+  std::filesystem::rename(temporaryPath, cachePath, fileError);
+  if (fileError) {
+    warning = "No se pudo finalizar la caché de «" + track.name + "»: " + fileError.message();
+    std::filesystem::remove(temporaryPath, fileError);
+  }
+}
+
+json testTrackCache() {
+  const auto token = std::chrono::steady_clock::now().time_since_epoch().count();
+  const std::filesystem::path directory = std::filesystem::temp_directory_path()
+    / ("compas-cache-test-" + std::to_string(token));
+  AudioTrack original;
+  original.name = "cache test";
+  original.analyzedBpm = 120.0;
+  original.tempoConfidence = 0.9;
+  original.samples.resize(2048 * kChannels);
+  for (size_t frame = 0; frame < 2048; ++frame) {
+    const float sample = static_cast<float>(std::sin(6.283185307179586 * 440.0 * frame / kSampleRate));
+    original.samples[frame * kChannels] = sample;
+    original.samples[frame * kChannels + 1] = sample;
+  }
+  original.waveform = makeWaveform(original.samples);
+  const std::string key(64, 'a');
+  std::string warning;
+  writeTrackCache(original, directory.u8string(), key, kSampleRate, warning);
+  AudioTrack restored;
+  restored.name = original.name;
+  const bool loaded = readTrackCache(restored, directory.u8string(), key, kSampleRate);
+  const bool passed = warning.empty() && loaded && restored.cacheHit
+    && restored.samples == original.samples && restored.waveform == original.waveform
+    && restored.analyzedBpm == original.analyzedBpm;
+  std::error_code fileError;
+  std::filesystem::remove(directory / (key + ".cmpcache"), fileError);
+  fileError.clear();
+  std::filesystem::remove(directory, fileError);
+  return {{"passed", passed}, {"cacheHit", loaded}, {"waveformBins", restored.waveform.size()}};
+}
+
+json testTransitionFade() {
+  constexpr uint64_t fadeFrames = 100;
+  const bool passed = transitionFadeGain(fadeFrames, 0, fadeFrames) == 1.0F
+    && std::abs(transitionFadeGain(fadeFrames, fadeFrames / 2, fadeFrames) - 0.5F) < 0.001F
+    && transitionFadeGain(fadeFrames, fadeFrames, fadeFrames) == 0.0F
+    && transitionFadeGain(fadeFrames, fadeFrames + 1, fadeFrames) == 0.0F;
+  return {{"passed", passed}, {"fadeFrames", fadeFrames}};
+}
+
 std::unique_ptr<AudioTrack> loadTrack(const json& request, int semitones, unsigned int targetRate,
-                                     double targetBpm) {
+                                     double targetBpm, const std::string& cacheDirectory) {
   const std::string path = request.at("path").get<std::string>();
   const std::string name = request.value("name", path);
-  ma_decoder_config config = ma_decoder_config_init(ma_format_f32, kChannels, targetRate);
-  ma_decoder decoder{};
-#ifdef _WIN32
-  const std::filesystem::path audioPath = std::filesystem::u8path(path);
-  ma_result result = ma_decoder_init_file_w(audioPath.c_str(), &config, &decoder);
-#else
-  ma_result result = ma_decoder_init_file(path.c_str(), &config, &decoder);
-#endif
-  if (result != MA_SUCCESS) {
-    throw std::runtime_error("No se pudo decodificar «" + name + "» (" + ma_result_description(result) + ").");
-  }
-
-  ma_uint64 frameCount = 0;
-  result = ma_decoder_get_length_in_pcm_frames(&decoder, &frameCount);
-  if (result != MA_SUCCESS || frameCount == 0 || frameCount > static_cast<ma_uint64>(INT_MAX / kChannels)) {
-    ma_decoder_uninit(&decoder);
-    throw std::runtime_error("La duración de «" + name + "» no es válida.");
-  }
-
   auto track = std::make_unique<AudioTrack>();
   track->id = request.value("id", std::string{});
   track->name = name;
-  track->samples.resize(static_cast<size_t>(frameCount) * kChannels);
-  ma_uint64 framesRead = 0;
-  result = ma_decoder_read_pcm_frames(&decoder, track->samples.data(), frameCount, &framesRead);
-  ma_decoder_uninit(&decoder);
-  if (result != MA_SUCCESS || framesRead == 0) {
-    throw std::runtime_error("No se pudo leer el audio de «" + name + "».");
-  }
-  track->samples.resize(static_cast<size_t>(framesRead) * kChannels);
   track->volume.store(request.value("volume", 1.0F));
   track->pan.store(request.value("pan", 0.0F));
   track->outputChannel.store(request.value("outputChannel", -1));
   track->pitchEnabled = request.value("pitchEnabled", true);
-  const auto estimate = analyzeTempo(track->samples, targetRate);
-  track->analyzedBpm = estimate.bpm;
-  track->tempoConfidence = estimate.confidence;
+  const std::string cacheKey = request.value("cacheKey", std::string{});
+  const bool cacheHit = readTrackCache(*track, cacheDirectory, cacheKey, targetRate);
+  if (!cacheHit) {
+    ma_decoder_config config = ma_decoder_config_init(ma_format_f32, kChannels, targetRate);
+    ma_decoder decoder{};
+#ifdef _WIN32
+    const std::filesystem::path audioPath = std::filesystem::u8path(path);
+    ma_result result = ma_decoder_init_file_w(audioPath.c_str(), &config, &decoder);
+#else
+    ma_result result = ma_decoder_init_file(path.c_str(), &config, &decoder);
+#endif
+    if (result != MA_SUCCESS) {
+      throw std::runtime_error("No se pudo decodificar «" + name + "» (" + ma_result_description(result) + ").");
+    }
+
+    ma_uint64 frameCount = 0;
+    result = ma_decoder_get_length_in_pcm_frames(&decoder, &frameCount);
+    if (result != MA_SUCCESS || frameCount == 0 || frameCount > static_cast<ma_uint64>(INT_MAX / kChannels)) {
+      ma_decoder_uninit(&decoder);
+      throw std::runtime_error("La duración de «" + name + "» no es válida.");
+    }
+
+    track->samples.resize(static_cast<size_t>(frameCount) * kChannels);
+    ma_uint64 framesRead = 0;
+    result = ma_decoder_read_pcm_frames(&decoder, track->samples.data(), frameCount, &framesRead);
+    ma_decoder_uninit(&decoder);
+    if (result != MA_SUCCESS || framesRead == 0) {
+      throw std::runtime_error("No se pudo leer el audio de «" + name + "».");
+    }
+    track->samples.resize(static_cast<size_t>(framesRead) * kChannels);
+    const auto estimate = analyzeTempo(track->samples, targetRate);
+    track->analyzedBpm = estimate.bpm;
+    track->tempoConfidence = estimate.confidence;
+    track->waveform = makeWaveform(track->samples);
+    writeTrackCache(*track, cacheDirectory, cacheKey, targetRate, track->cacheWarning);
+  }
   double durationRatio = 1.0;
-  if (estimate.bpm > 0.0 && targetBpm >= 30.0 && targetBpm <= 300.0) {
-    const double candidateRatio = estimate.bpm / targetBpm;
+  if (track->analyzedBpm > 0.0 && targetBpm >= 30.0 && targetBpm <= 300.0) {
+    const double candidateRatio = track->analyzedBpm / targetBpm;
     if (candidateRatio >= 0.75 && candidateRatio <= 1.5) {
       durationRatio = candidateRatio;
       track->tempoSynced = true;
@@ -412,60 +658,55 @@ int audioCallback(void* outputBuffer, void*, unsigned int frames,
 
   const uint64_t generation = engine->playbackGeneration.load();
   const auto tracks = std::atomic_load(&engine->tracks);
+  const auto transition = std::atomic_load(&engine->transition);
   const uint64_t startFrame = engine->position.load();
   const uint64_t endFrame = engine->duration.load();
   const float master = engine->masterVolume.load();
   const float setlistMaster = engine->setlistVolume.load();
-  const double beatFrames = static_cast<double>(engine->sampleRate) * 60.0 / engine->clickBpm.load();
-  const int beats = std::max(1, engine->clickBeats.load());
 
   for (unsigned int frame = 0; frame < frames && startFrame + frame < endFrame; ++frame) {
     const uint64_t songFrame = startFrame + frame;
     for (const auto& track : *tracks) {
-      const auto channel = track->outputChannel.load();
-      const float volume = track->volume.load() * master;
-      const float pan = std::clamp(track->pan.load(), -1.0F, 1.0F);
-      const size_t sourceIndex = static_cast<size_t>(songFrame) * kChannels;
-      if (sourceIndex + 1 >= track->samples.size()) continue;
-      const float left = track->samples[sourceIndex];
-      const float right = track->samples[sourceIndex + 1];
-
-      if (channel >= 0) {
-        if (static_cast<unsigned int>(channel) < engine->outputChannels) {
-          output[static_cast<size_t>(frame) * engine->outputChannels + static_cast<unsigned int>(channel)]
-            += (left + right) * 0.5F * volume;
-        }
-      } else if (channel <= -2) {
-        const unsigned int firstChannel = static_cast<unsigned int>(-channel - 2);
-        if (firstChannel + 1 < engine->outputChannels) {
-          output[static_cast<size_t>(frame) * engine->outputChannels + firstChannel] += left * volume;
-          output[static_cast<size_t>(frame) * engine->outputChannels + firstChannel + 1] += right * volume;
-        }
-      } else {
-        const float leftGain = pan > 0.0F ? 1.0F - pan : 1.0F;
-        const float rightGain = pan < 0.0F ? 1.0F + pan : 1.0F;
-        output[static_cast<size_t>(frame) * engine->outputChannels] += left * leftGain * volume;
-        output[static_cast<size_t>(frame) * engine->outputChannels + 1] += right * rightGain * volume;
-      }
+      mixTrackFrame(output + static_cast<size_t>(frame) * engine->outputChannels,
+        engine->outputChannels, *track, songFrame, track->volume.load() * master);
     }
 
     if (engine->clickEnabled.load()) {
-      const auto beat = static_cast<uint64_t>(static_cast<double>(songFrame) / beatFrames);
-      const auto beatPosition = static_cast<double>(songFrame) - static_cast<double>(beat) * beatFrames;
-      if (beatPosition < engine->sampleRate * 0.035) {
-        const float accent = beat % static_cast<uint64_t>(beats) == 0 ? 1.0F : 0.65F;
-        const float envelope = static_cast<float>(1.0 - beatPosition / (engine->sampleRate * 0.035));
-        const double frequency = accent > 0.9F ? 1560.0 : 1040.0;
-        const float click = static_cast<float>(std::sin(6.283185307179586 * frequency * beatPosition / engine->sampleRate))
-          * envelope * engine->clickVolume.load() * accent * 0.65F;
-        addRoutedClick(output + static_cast<size_t>(frame) * engine->outputChannels,
-          engine->outputChannels, engine->clickOutputChannel.load(), click);
-      }
+      const float click = clickSample(songFrame, engine->sampleRate, engine->clickBpm.load(),
+        engine->clickBeats.load(), engine->clickVolume.load());
+      addRoutedClick(output + static_cast<size_t>(frame) * engine->outputChannels,
+        engine->outputChannels, engine->clickOutputChannel.load(), click);
     }
     float* mixedFrame = output + static_cast<size_t>(frame) * engine->outputChannels;
     for (unsigned int channel = 0; channel < engine->outputChannels; ++channel) {
       mixedFrame[channel] *= setlistMaster;
     }
+
+    if (transition) {
+      const uint64_t remaining = transition->fadeRemaining.load();
+      const uint64_t transitionFrame = transition->position.load() + frame;
+      if (remaining > frame && transitionFrame < transition->duration) {
+        const uint64_t fadeTotal = static_cast<uint64_t>(transition->sampleRate) * 35 / 100;
+        const float fade = transitionFadeGain(remaining, frame, fadeTotal);
+        float* transitionOutput = output + static_cast<size_t>(frame) * engine->outputChannels;
+        for (const auto& track : *transition->tracks) {
+          mixTrackFrame(transitionOutput, engine->outputChannels, *track, transitionFrame,
+            track->volume.load() * transition->masterVolume * fade * transition->setlistVolume);
+        }
+        if (transition->clickEnabled) {
+          const float click = clickSample(transitionFrame, transition->sampleRate, transition->clickBpm,
+            transition->clickBeats, transition->clickVolume) * fade * transition->setlistVolume;
+          addRoutedClick(transitionOutput, engine->outputChannels, transition->clickOutputChannel, click);
+        }
+      }
+    }
+  }
+  if (transition) {
+    const uint64_t remaining = transition->fadeRemaining.load();
+    const uint64_t consumed = std::min<uint64_t>(remaining, frames);
+    transition->position.store(std::min(transition->position.load() + frames, transition->duration));
+    transition->fadeRemaining.store(remaining - consumed);
+    if (remaining <= frames) std::atomic_store(&engine->transition, std::shared_ptr<TransitionDeck>{});
   }
   if (generation == engine->playbackGeneration.load()) {
     engine->position.store(std::min(startFrame + frames, endFrame));
@@ -475,6 +716,36 @@ int audioCallback(void* outputBuffer, void*, unsigned int frames,
     }
   }
   return 0;
+}
+
+json testDualDeckCrossfade() {
+  AudioEngine engine;
+  engine.outputChannels = 2;
+  engine.sampleRate = 1000;
+  engine.duration.store(1000);
+  engine.playing.store(true);
+  auto currentTrack = std::make_shared<AudioTrack>();
+  auto outgoingTrack = std::make_shared<AudioTrack>();
+  currentTrack->samples.assign(1000 * kChannels, 0.2F);
+  outgoingTrack->samples.assign(1000 * kChannels, 0.8F);
+  auto currentTracks = std::make_shared<TrackSet>();
+  currentTracks->push_back(currentTrack);
+  std::atomic_store(&engine.tracks, std::shared_ptr<const TrackSet>(currentTracks));
+  auto outgoing = std::make_shared<TransitionDeck>();
+  auto outgoingTracks = std::make_shared<TrackSet>();
+  outgoingTracks->push_back(outgoingTrack);
+  outgoing->tracks = outgoingTracks;
+  outgoing->duration = 1000;
+  outgoing->sampleRate = 1000;
+  outgoing->fadeRemaining.store(350);
+  std::atomic_store(&engine.transition, outgoing);
+  std::vector<float> output(100 * kChannels, 0.0F);
+  audioCallback(output.data(), nullptr, 100, 0.0, RTAUDIO_INPUT_OVERFLOW, &engine);
+  const float firstFrame = output[0];
+  const float lastFrame = output[(99 * kChannels)];
+  return {{"passed", std::abs(firstFrame - 1.0F) < 0.001F
+      && lastFrame < firstFrame && lastFrame > 0.2F},
+    {"firstFrame", firstFrame}, {"lastFrame", lastFrame}};
 }
 
 void closeStream(AudioEngine& engine) {
@@ -492,10 +763,24 @@ void startPlayback(AudioEngine& engine, const json& request) {
   const std::string apiString = request.value("api", "asio");
   const RtAudio::Api api = parseApi(apiString);
   const unsigned int deviceId = request.at("deviceId").get<unsigned int>();
+  const unsigned int requestedSampleRate = request.value("sampleRate", 0U);
+  const unsigned int requestedBufferFrames = request.value("bufferFrames", 512U);
+  if (requestedSampleRate != 0
+      && requestedSampleRate != 44100 && requestedSampleRate != 48000
+      && requestedSampleRate != 88200 && requestedSampleRate != 96000) {
+    throw std::runtime_error("La frecuencia de muestreo seleccionada no está permitida.");
+  }
+  if (requestedBufferFrames != 64 && requestedBufferFrames != 128
+      && requestedBufferFrames != 256 && requestedBufferFrames != 512
+      && requestedBufferFrames != 1024 && requestedBufferFrames != 2048) {
+    throw std::runtime_error("El tamaño del búfer seleccionado no está permitido.");
+  }
   const bool reuseStream = engine.audio
     && engine.audio->isStreamOpen()
     && engine.api == apiString
-    && engine.deviceId == deviceId;
+    && engine.deviceId == deviceId
+    && engine.requestedSampleRate == requestedSampleRate
+    && engine.bufferFrames == requestedBufferFrames;
   std::unique_ptr<RtAudio> nextAudio;
   if (!reuseStream) nextAudio = std::make_unique<RtAudio>(api, [](RtAudioErrorType, const std::string&) {});
   RtAudio* audio = reuseStream ? engine.audio.get() : nextAudio.get();
@@ -508,7 +793,12 @@ void startPlayback(AudioEngine& engine, const json& request) {
   if (device.name.empty() || device.outputChannels == 0) {
     throw std::runtime_error("El dispositivo seleccionado no ofrece salidas de audio.");
   }
-  const unsigned int sampleRate = device.preferredSampleRate == 0 ? kSampleRate : device.preferredSampleRate;
+  const unsigned int preferredSampleRate = device.preferredSampleRate == 0 ? kSampleRate : device.preferredSampleRate;
+  const unsigned int sampleRate = requestedSampleRate == 0 ? preferredSampleRate : requestedSampleRate;
+  if (requestedSampleRate != 0 && !device.sampleRates.empty()
+      && std::find(device.sampleRates.begin(), device.sampleRates.end(), requestedSampleRate) == device.sampleRates.end()) {
+    throw std::runtime_error("El dispositivo no admite la frecuencia de muestreo seleccionada.");
+  }
 
   const int semitones = request.value("pitchSemitones", 0);
   const double targetBpm = request.value("targetBpm", 120.0);
@@ -517,41 +807,33 @@ void startPlayback(AudioEngine& engine, const json& request) {
   }
   const auto& trackRequests = request.at("tracks");
   if (!trackRequests.is_array()) throw std::runtime_error("La lista de pistas no es válida.");
+  const std::string cacheDirectory = request.value("cacheDirectory", std::string{});
   auto nextTracks = std::make_shared<TrackSet>();
   nextTracks->reserve(trackRequests.size());
   for (const auto& trackRequest : trackRequests) {
     emit({{"event", "preparing"}, {"songId", request.value("songId", std::string{})},
       {"track", trackRequest.value("name", "")}});
-    nextTracks->emplace_back(loadTrack(trackRequest, semitones, sampleRate, targetBpm));
+    auto track = loadTrack(trackRequest, semitones, sampleRate, targetBpm, cacheDirectory);
+    if (!track->cacheWarning.empty()) {
+      emit({{"event", "cache-warning"}, {"songId", request.value("songId", std::string{})},
+        {"message", track->cacheWarning}});
+    }
+    nextTracks->emplace_back(std::move(track));
   }
 
   uint64_t duration = 0;
+  size_t cachedTracks = 0;
   int requiredChannels = 2;
   json waveforms = json::array();
   json trackAnalysis = json::array();
-  constexpr size_t waveformBins = 1024;
   for (const auto& track : *nextTracks) {
+    if (track->cacheHit) ++cachedTracks;
     duration = std::max<uint64_t>(duration, track->samples.size() / kChannels);
     const int route = track->outputChannel.load();
     requiredChannels = std::max(requiredChannels, routedChannelCount(route));
 
-    const size_t frameCount = track->samples.size() / kChannels;
-    std::vector<double> powers(waveformBins, 0.0);
-    std::vector<uint64_t> counts(waveformBins, 0);
-    for (size_t frame = 0; frame < frameCount; ++frame) {
-      const size_t bin = std::min(waveformBins - 1, frame * waveformBins / frameCount);
-      const double left = track->samples[frame * kChannels];
-      const double right = track->samples[frame * kChannels + 1];
-      powers[bin] += (left * left + right * right) * 0.5;
-      ++counts[bin];
-    }
-    double peakPower = 0.0;
-    for (size_t bin = 0; bin < waveformBins; ++bin) {
-      if (counts[bin] != 0) powers[bin] /= static_cast<double>(counts[bin]);
-      peakPower = std::max(peakPower, powers[bin]);
-    }
     json values = json::array();
-    for (const double power : powers) values.push_back(peakPower > 0.0 ? power / peakPower : 0.0);
+    for (const float value : track->waveform) values.push_back(value);
     waveforms.push_back({{"id", track->id}, {"name", track->name}, {"values", std::move(values)}});
     trackAnalysis.push_back({
       {"id", track->id},
@@ -571,6 +853,25 @@ void startPlayback(AudioEngine& engine, const json& request) {
     throw std::runtime_error("El número de salidas seleccionado no es válido para este dispositivo.");
   }
 
+  if (reuseStream && engine.playing.load()) {
+    auto outgoing = std::make_shared<TransitionDeck>();
+    outgoing->tracks = std::atomic_load(&engine.tracks);
+    outgoing->position.store(engine.position.load());
+    outgoing->duration = engine.duration.load();
+    outgoing->masterVolume = engine.masterVolume.load();
+    outgoing->setlistVolume = engine.setlistVolume.load();
+    outgoing->clickEnabled = engine.clickEnabled.load();
+    outgoing->clickVolume = engine.clickVolume.load();
+    outgoing->clickOutputChannel = engine.clickOutputChannel.load();
+    outgoing->clickBpm = engine.clickBpm.load();
+    outgoing->clickBeats = engine.clickBeats.load();
+    outgoing->sampleRate = engine.sampleRate;
+    outgoing->fadeRemaining.store(static_cast<uint64_t>(engine.sampleRate) * 35 / 100);
+    std::atomic_store(&engine.transition, std::move(outgoing));
+  } else {
+    std::atomic_store(&engine.transition, std::shared_ptr<TransitionDeck>{});
+  }
+
   const bool clickOnly = request.value("clickOnly", false);
   const uint64_t playbackDuration = clickOnly ? UINT64_MAX : duration;
   const double startOffset = request.value("startOffsetSeconds", 0.0);
@@ -582,18 +883,21 @@ void startPlayback(AudioEngine& engine, const json& request) {
   if (!reuseStream) {
     engine.playbackGeneration.fetch_add(1);
     engine.playing.store(false);
+    std::atomic_store(&engine.transition, std::shared_ptr<TransitionDeck>{});
     closeStream(engine);
     engine.audio = std::move(nextAudio);
     engine.api = apiString;
     engine.deviceId = deviceId;
     engine.sampleRate = sampleRate;
+    engine.bufferFrames = requestedBufferFrames;
+    engine.requestedSampleRate = requestedSampleRate;
     engine.outputChannels = device.outputChannels;
   }
 
   auto previousTracks = std::atomic_load(&engine.tracks);
   if (previousTracks && !previousTracks->empty()) engine.retiredTrackSets.push_back(previousTracks);
   engine.playbackGeneration.fetch_add(1);
-  engine.playing.store(false);
+  if (!reuseStream) engine.playing.store(false);
   engine.finished.store(false);
   engine.position.store(std::min(startFrame, playbackDuration));
   engine.duration.store(playbackDuration);
@@ -615,7 +919,7 @@ void startPlayback(AudioEngine& engine, const json& request) {
     output.deviceId = deviceId;
     output.nChannels = engine.outputChannels;
     output.firstChannel = 0;
-    unsigned int bufferFrames = 512;
+    unsigned int bufferFrames = requestedBufferFrames;
     auto result = engine.audio->openStream(&output, nullptr, RTAUDIO_FLOAT32, engine.sampleRate,
       &bufferFrames, audioCallback, &engine);
     if (result != RTAUDIO_NO_ERROR) throw std::runtime_error(engine.audio->getErrorText());
@@ -626,6 +930,7 @@ void startPlayback(AudioEngine& engine, const json& request) {
   emit({{"event", "playing"}, {"durationFrames", duration},
     {"positionFrames", engine.position.load()},
     {"sampleRate", engine.sampleRate}, {"outputChannels", engine.outputChannels},
+    {"bufferFrames", engine.bufferFrames}, {"cachedTracks", cachedTracks},
     {"songId", request.value("songId", std::string{})},
     {"waveforms", std::move(waveforms)}, {"trackAnalysis", std::move(trackAnalysis)}});
 }
@@ -759,6 +1064,21 @@ int main(int argc, char** argv) {
     }
     if (argc >= 2 && std::string(argv[1]) == "--test-click-routing") {
       const auto result = testClickRouting();
+      std::cout << result.dump() << std::endl;
+      return result.at("passed").get<bool>() ? 0 : 1;
+    }
+    if (argc >= 2 && std::string(argv[1]) == "--test-transition-fade") {
+      const auto result = testTransitionFade();
+      std::cout << result.dump() << std::endl;
+      return result.at("passed").get<bool>() ? 0 : 1;
+    }
+    if (argc >= 2 && std::string(argv[1]) == "--test-track-cache") {
+      const auto result = testTrackCache();
+      std::cout << result.dump() << std::endl;
+      return result.at("passed").get<bool>() ? 0 : 1;
+    }
+    if (argc >= 2 && std::string(argv[1]) == "--test-dual-deck-crossfade") {
+      const auto result = testDualDeckCrossfade();
       std::cout << result.dump() << std::endl;
       return result.at("passed").get<bool>() ? 0 : 1;
     }

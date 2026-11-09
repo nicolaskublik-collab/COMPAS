@@ -3,7 +3,7 @@ const { execFile, spawn } = require('node:child_process');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const readline = require('node:readline');
-const { randomUUID } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const { promisify } = require('node:util');
 
 const PLAYABLE_AUDIO_EXTENSIONS = new Set(['.wav', '.mp3', '.flac', '.ogg']);
@@ -18,7 +18,10 @@ const DEFAULT_METRONOME = Object.freeze({ enabled: false, bpm: 120, beats: 4, vo
 const DEFAULT_SETTINGS = Object.freeze({
   selectedAudioApi: 'asio',
   selectedAudioDevice: '',
-  midiMappings: []
+  selectedSampleRate: 0,
+  bufferFrames: 512,
+  midiMappings: [],
+  keyMappings: []
 });
 const execFileAsync = promisify(execFile);
 let window;
@@ -53,6 +56,8 @@ function validateLibrary(value) {
       || song.bpm > 300
       || typeof song.key !== 'string'
       || (song.key !== '' && !MUSICAL_KEYS.has(song.key))
+      || typeof song.pitchTargetKey !== 'string'
+      || (song.pitchTargetKey !== '' && !MUSICAL_KEYS.has(song.pitchTargetKey))
       || typeof song.clickOnly !== 'boolean'
       || !Number.isInteger(song.pitchSemitones)
       || song.pitchSemitones < -12
@@ -74,6 +79,16 @@ function validateLibrary(value) {
       || (song.clickOnly && song.tracks.length !== 0)
       || (!song.clickOnly && song.tracks.length === 0)) {
       throw new Error(`La configuración de «${song.name}» es inválida.`);
+    }
+    if (!Array.isArray(song.markers) || !Array.isArray(song.regions)
+      || song.markers.some((marker) => !marker || typeof marker.id !== 'string'
+        || typeof marker.name !== 'string' || marker.name.length > 80
+        || typeof marker.position !== 'number' || !Number.isFinite(marker.position) || marker.position < 0)
+      || song.regions.some((region) => !region || typeof region.id !== 'string'
+        || typeof region.name !== 'string' || region.name.length > 80
+        || typeof region.start !== 'number' || !Number.isFinite(region.start) || region.start < 0
+        || typeof region.end !== 'number' || !Number.isFinite(region.end) || region.end <= region.start)) {
+      throw new Error(`Los puntos o regiones de «${song.name}» son inválidos.`);
     }
     if (songIds.has(song.id)) throw new Error('Hay identificadores de canción duplicados.');
     songIds.add(song.id);
@@ -103,6 +118,16 @@ function validateLibrary(value) {
   }
 }
 
+function keyForTransposition(source, semitones) {
+  if (!MUSICAL_KEYS.has(source)) return '';
+  const isMinor = source.endsWith('m');
+  const root = source.replace(/m$/, '');
+  const keys = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B'];
+  const roots = { C: 0, 'C#': 1, Db: 1, D: 2, 'D#': 3, Eb: 3, E: 4, F: 5, 'F#': 6, Gb: 6, G: 7, 'G#': 8, Ab: 8, A: 9, 'A#': 10, Bb: 10, B: 11 };
+  const target = keys[((roots[root] + semitones) % 12 + 12) % 12];
+  return `${target}${isMinor ? 'm' : ''}`;
+}
+
 function migrateLibrary(value) {
   return {
     ...value,
@@ -110,13 +135,19 @@ function migrateLibrary(value) {
       const bpm = Number.isInteger(song.bpm) && song.bpm >= 30 && song.bpm <= 300
         ? song.bpm
         : (song.metronome?.bpm ?? DEFAULT_METRONOME.bpm);
+      const pitchSemitones = Number.isInteger(song.pitchSemitones) ? song.pitchSemitones : 0;
       return {
         ...song,
         artist: typeof song.artist === 'string' ? song.artist : '',
         bpm,
         key: typeof song.key === 'string' && MUSICAL_KEYS.has(song.key) ? song.key : '',
+        pitchTargetKey: typeof song.pitchTargetKey === 'string' && MUSICAL_KEYS.has(song.pitchTargetKey)
+          ? song.pitchTargetKey
+          : keyForTransposition(song.key, pitchSemitones),
+        markers: Array.isArray(song.markers) ? song.markers : [],
+        regions: Array.isArray(song.regions) ? song.regions : [],
         clickOnly: song.clickOnly === true,
-        pitchSemitones: Number.isInteger(song.pitchSemitones) ? song.pitchSemitones : 0,
+        pitchSemitones,
         metronome: {
           ...DEFAULT_METRONOME,
           ...(song.metronome ?? {}),
@@ -209,13 +240,17 @@ function validateSettings(value) {
   if (!value
     || !['asio', 'wasapi'].includes(value.selectedAudioApi)
     || typeof value.selectedAudioDevice !== 'string'
-    || !Array.isArray(value.midiMappings)) {
+    || ![0, 44100, 48000, 88200, 96000].includes(value.selectedSampleRate)
+    || ![64, 128, 256, 512, 1024, 2048].includes(value.bufferFrames)
+    || !Array.isArray(value.midiMappings)
+    || !Array.isArray(value.keyMappings)) {
     throw new Error('La configuración de audio/MIDI tiene un formato inválido.');
   }
+  const allowedActions = new Set(['play', 'stop', 'next', 'previous', 'restart', 'addMarker', 'regionStart', 'regionEnd']);
   const actions = new Set();
   for (const mapping of value.midiMappings) {
     if (!mapping
-      || !['play', 'stop', 'next'].includes(mapping.action)
+      || !allowedActions.has(mapping.action)
       || typeof mapping.inputId !== 'string'
       || typeof mapping.inputName !== 'string'
       || !['note', 'cc'].includes(mapping.messageType)
@@ -229,6 +264,20 @@ function validateSettings(value) {
       throw new Error('Hay una asignación MIDI inválida o duplicada.');
     }
     actions.add(mapping.action);
+  }
+  const keyActions = new Set();
+  const keyCodes = new Set();
+  for (const mapping of value.keyMappings) {
+    const code = mapping?.code;
+    if (!mapping || !allowedActions.has(mapping.action)
+      || typeof code !== 'string' || !/^(?:Key[A-Z]|Digit[0-9]|Numpad[0-9]|Space|Arrow(?:Up|Down|Left|Right)|Home|End|Enter|Escape|F(?:[1-9]|1[0-2]))$/.test(code)
+      || typeof mapping.ctrl !== 'boolean' || typeof mapping.alt !== 'boolean' || typeof mapping.shift !== 'boolean'
+      || keyActions.has(mapping.action)
+      || keyCodes.has(`${mapping.code}:${mapping.ctrl}:${mapping.alt}:${mapping.shift}`)) {
+      throw new Error('Hay una asignación de teclado inválida o duplicada.');
+    }
+    keyActions.add(mapping.action);
+    keyCodes.add(`${mapping.code}:${mapping.ctrl}:${mapping.alt}:${mapping.shift}`);
   }
 }
 
@@ -267,7 +316,12 @@ async function loadSettings() {
     const migrated = {
       selectedAudioApi: parsed.selectedAudioApi ?? 'asio',
       selectedAudioDevice: parsed.selectedAudioDevice ?? '',
-      midiMappings: parsed.midiMappings
+      selectedSampleRate: [0, 44100, 48000, 88200, 96000].includes(parsed.selectedSampleRate)
+        ? parsed.selectedSampleRate : 0,
+      bufferFrames: [64, 128, 256, 512, 1024, 2048].includes(parsed.bufferFrames)
+        ? parsed.bufferFrames : 512,
+      midiMappings: parsed.midiMappings ?? [],
+      keyMappings: Array.isArray(parsed.keyMappings) ? parsed.keyMappings : []
     };
     validateSettings(migrated);
     settings = migrated;
@@ -375,6 +429,20 @@ function validateTrackMix(song, trackMix) {
   });
 }
 
+async function addTrackCacheKeys(tracks, sampleRate) {
+  return Promise.all(tracks.map(async (track) => {
+    const stat = await fs.stat(track.path);
+    if (!stat.isFile()) throw new Error(`El archivo de audio «${track.name}» ya no está disponible.`);
+    const cacheKey = createHash('sha256').update(JSON.stringify({
+      path: path.resolve(track.path),
+      size: stat.size,
+      modified: stat.mtimeMs,
+      sampleRate
+    })).digest('hex');
+    return { ...track, cacheKey };
+  }));
+}
+
 async function sendAudioCommand(command) {
   if (!command || typeof command.action !== 'string') throw new Error('Comando de audio inválido.');
   const allowedActions = new Set(['play', 'pause', 'resume', 'stop', 'seek', 'mix', 'status']);
@@ -407,19 +475,24 @@ async function sendAudioCommand(command) {
         || command.startOffsetSeconds < 0) {
         throw new Error('La posición inicial de la canción no es válida.');
       }
+      const pitchSemitones = song.pitchSemitones;
+      const tracksWithCache = await addTrackCacheKeys(tracks, settings.selectedSampleRate);
       payload = {
         action: 'play',
         songId: song.id,
         api: settings.selectedAudioApi,
         deviceId,
+        sampleRate: settings.selectedSampleRate,
+        bufferFrames: settings.bufferFrames,
+        cacheDirectory: path.join(app.getPath('userData'), 'audio-cache'),
         clickOnly: song.clickOnly,
         startOffsetSeconds: command.startOffsetSeconds,
-        pitchSemitones: song.pitchSemitones,
+        pitchSemitones,
         targetBpm: song.bpm,
         masterVolume,
         setlistVolume,
         metronome,
-        tracks
+        tracks: tracksWithCache
       };
     }
   } else if (command.action === 'seek') {
@@ -499,6 +572,9 @@ ipcMain.handle('library:import', async (_event, metadata) => {
     key: metadata.key,
     clickOnly: false,
     pitchSemitones: 0,
+    pitchTargetKey: metadata.key,
+    markers: [],
+    regions: [],
     metronome: { ...DEFAULT_METRONOME, bpm: metadata.bpm },
     tracks: files.map((file) => ({
       id: randomUUID(),
@@ -528,6 +604,9 @@ ipcMain.handle('library:create-click-song', async (_event, name) => {
     key: '',
     clickOnly: true,
     pitchSemitones: 0,
+    pitchTargetKey: '',
+    markers: [],
+    regions: [],
     metronome: { ...DEFAULT_METRONOME, enabled: true },
     tracks: []
   };
