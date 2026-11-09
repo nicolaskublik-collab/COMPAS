@@ -31,6 +31,7 @@ struct AudioTrack {
   std::string id;
   std::string name;
   std::vector<float> samples;
+  bool pitchEnabled{true};
   double analyzedBpm{0.0};
   double tempoConfidence{0.0};
   bool tempoSynced{false};
@@ -53,7 +54,9 @@ struct AudioEngine {
   std::atomic<uint64_t> position{0};
   std::atomic<uint64_t> duration{0};
   std::atomic<float> masterVolume{1.0F};
+  std::atomic<float> setlistVolume{1.0F};
   std::atomic<float> clickVolume{0.0F};
+  std::atomic<int> clickOutputChannel{-1};
   std::atomic<double> clickBpm{120.0};
   std::atomic<int> clickBeats{4};
   std::atomic<bool> clickEnabled{false};
@@ -270,6 +273,82 @@ json testTempoSync() {
   };
 }
 
+int effectivePitch(int semitones, bool enabled) {
+  return enabled ? semitones : 0;
+}
+
+void addRoutedClick(float* output, unsigned int outputChannels, int route, float sample) {
+  if (route >= 0) {
+    if (static_cast<unsigned int>(route) < outputChannels) {
+      output[route] += sample;
+    }
+  } else if (route <= -2) {
+    const unsigned int firstChannel = static_cast<unsigned int>(-route - 2);
+    if (firstChannel + 1 < outputChannels) {
+      output[firstChannel] += sample;
+      output[firstChannel + 1] += sample;
+    }
+  } else if (outputChannels >= 2) {
+    output[0] += sample;
+    output[1] += sample;
+  }
+}
+
+int routedChannelCount(int route) {
+  if (route >= 0) return route + 1;
+  if (route <= -2) return -route;
+  return 2;
+}
+
+json testPitchProtection() {
+  AudioTrack testTrack;
+  testTrack.pitchEnabled = false;
+  constexpr double inputFrequency = 440.0;
+  constexpr size_t frames = kSampleRate;
+  testTrack.samples.resize(frames * kChannels);
+  for (size_t frame = 0; frame < frames; ++frame) {
+    const float sample = static_cast<float>(std::sin(6.283185307179586 * inputFrequency * frame / kSampleRate));
+    testTrack.samples[frame * kChannels] = sample;
+    testTrack.samples[frame * kChannels + 1] = sample;
+  }
+  constexpr double durationRatio = 0.9;
+  const size_t expectedFrames = static_cast<size_t>(std::llround(frames * durationRatio));
+  processTrack(testTrack, effectivePitch(12, testTrack.pitchEnabled), durationRatio, kSampleRate);
+  size_t crossings = 0;
+  constexpr size_t startFrame = 10000;
+  constexpr size_t endFrame = 40000;
+  for (size_t frame = startFrame + 1; frame < endFrame; ++frame) {
+    if (testTrack.samples[(frame - 1) * kChannels] <= 0.0F
+        && testTrack.samples[frame * kChannels] > 0.0F) {
+      ++crossings;
+    }
+  }
+  const double measuredFrequency = static_cast<double>(crossings) * kSampleRate / (endFrame - startFrame);
+  return {
+    {"passed", std::abs(measuredFrequency - inputFrequency) < 20.0
+      && testTrack.samples.size() == expectedFrames * kChannels},
+    {"inputHz", inputFrequency},
+    {"outputHz", measuredFrequency},
+    {"inputFrames", frames},
+    {"outputFrames", testTrack.samples.size() / kChannels}
+  };
+}
+
+json testClickRouting() {
+  std::vector<float> output(6, 0.0F);
+  addRoutedClick(output.data(), 6, 4, 0.5F);
+  const bool monoPassed = output[4] == 0.5F && output[3] == 0.0F;
+  std::fill(output.begin(), output.end(), 0.0F);
+  addRoutedClick(output.data(), 6, -4, 0.5F);
+  const bool stereoPassed = output[2] == 0.5F && output[3] == 0.5F
+    && output[1] == 0.0F;
+  std::fill(output.begin(), output.end(), 0.0F);
+  addRoutedClick(output.data(), 6, -1, 0.5F);
+  const bool masterPassed = output[0] == 0.5F && output[1] == 0.5F
+    && routedChannelCount(4) == 5 && routedChannelCount(-4) == 4;
+  return {{"passed", monoPassed && stereoPassed && masterPassed}};
+}
+
 std::unique_ptr<AudioTrack> loadTrack(const json& request, int semitones, unsigned int targetRate,
                                      double targetBpm) {
   const std::string path = request.at("path").get<std::string>();
@@ -307,6 +386,7 @@ std::unique_ptr<AudioTrack> loadTrack(const json& request, int semitones, unsign
   track->volume.store(request.value("volume", 1.0F));
   track->pan.store(request.value("pan", 0.0F));
   track->outputChannel.store(request.value("outputChannel", -1));
+  track->pitchEnabled = request.value("pitchEnabled", true);
   const auto estimate = analyzeTempo(track->samples, targetRate);
   track->analyzedBpm = estimate.bpm;
   track->tempoConfidence = estimate.confidence;
@@ -318,7 +398,7 @@ std::unique_ptr<AudioTrack> loadTrack(const json& request, int semitones, unsign
       track->tempoSynced = true;
     }
   }
-  processTrack(*track, semitones, durationRatio, targetRate);
+  processTrack(*track, effectivePitch(semitones, track->pitchEnabled), durationRatio, targetRate);
   return track;
 }
 
@@ -335,6 +415,7 @@ int audioCallback(void* outputBuffer, void*, unsigned int frames,
   const uint64_t startFrame = engine->position.load();
   const uint64_t endFrame = engine->duration.load();
   const float master = engine->masterVolume.load();
+  const float setlistMaster = engine->setlistVolume.load();
   const double beatFrames = static_cast<double>(engine->sampleRate) * 60.0 / engine->clickBpm.load();
   const int beats = std::max(1, engine->clickBeats.load());
 
@@ -376,10 +457,14 @@ int audioCallback(void* outputBuffer, void*, unsigned int frames,
         const float envelope = static_cast<float>(1.0 - beatPosition / (engine->sampleRate * 0.035));
         const double frequency = accent > 0.9F ? 1560.0 : 1040.0;
         const float click = static_cast<float>(std::sin(6.283185307179586 * frequency * beatPosition / engine->sampleRate))
-          * envelope * engine->clickVolume.load() * accent * 0.22F;
-        output[static_cast<size_t>(frame) * engine->outputChannels] += click;
-        output[static_cast<size_t>(frame) * engine->outputChannels + 1] += click;
+          * envelope * engine->clickVolume.load() * accent * 0.65F;
+        addRoutedClick(output + static_cast<size_t>(frame) * engine->outputChannels,
+          engine->outputChannels, engine->clickOutputChannel.load(), click);
       }
+    }
+    float* mixedFrame = output + static_cast<size_t>(frame) * engine->outputChannels;
+    for (unsigned int channel = 0; channel < engine->outputChannels; ++channel) {
+      mixedFrame[channel] *= setlistMaster;
     }
   }
   if (generation == engine->playbackGeneration.load()) {
@@ -448,8 +533,7 @@ void startPlayback(AudioEngine& engine, const json& request) {
   for (const auto& track : *nextTracks) {
     duration = std::max<uint64_t>(duration, track->samples.size() / kChannels);
     const int route = track->outputChannel.load();
-    if (route >= 0) requiredChannels = std::max(requiredChannels, route + 1);
-    if (route <= -2) requiredChannels = std::max(requiredChannels, -route);
+    requiredChannels = std::max(requiredChannels, routedChannelCount(route));
 
     const size_t frameCount = track->samples.size() / kChannels;
     std::vector<double> powers(waveformBins, 0.0);
@@ -476,6 +560,9 @@ void startPlayback(AudioEngine& engine, const json& request) {
       {"synced", track->tempoSynced}
     });
   }
+  const auto click = request.value("metronome", json::object());
+  requiredChannels = std::max(requiredChannels,
+    routedChannelCount(click.value("outputChannel", -1)));
   if (requiredChannels > static_cast<int>(device.outputChannels)) {
     throw std::runtime_error("La asignación requiere " + std::to_string(requiredChannels)
       + " salidas, pero el dispositivo solo ofrece " + std::to_string(device.outputChannels) + ".");
@@ -511,9 +598,10 @@ void startPlayback(AudioEngine& engine, const json& request) {
   engine.position.store(std::min(startFrame, playbackDuration));
   engine.duration.store(playbackDuration);
   engine.masterVolume.store(request.value("masterVolume", 1.0F));
-  const auto click = request.value("metronome", json::object());
+  engine.setlistVolume.store(request.value("setlistVolume", 1.0F));
   engine.clickEnabled.store(click.value("enabled", false));
   engine.clickVolume.store(click.value("volume", 0.6F));
+  engine.clickOutputChannel.store(click.value("outputChannel", -1));
   engine.clickBpm.store(click.value("bpm", 120.0));
   engine.clickBeats.store(click.value("beats", 4));
   std::shared_ptr<const TrackSet> immutableTracks = std::move(nextTracks);
@@ -544,6 +632,7 @@ void startPlayback(AudioEngine& engine, const json& request) {
 
 void applyMix(AudioEngine& engine, const json& request) {
   engine.masterVolume.store(request.value("masterVolume", engine.masterVolume.load()));
+  engine.setlistVolume.store(request.value("setlistVolume", engine.setlistVolume.load()));
   const auto& values = request.at("tracks");
   const auto tracks = std::atomic_load(&engine.tracks);
   if (!values.is_array() || values.size() != tracks->size()) {
@@ -557,6 +646,7 @@ void applyMix(AudioEngine& engine, const json& request) {
   const auto metronome = request.value("metronome", json::object());
   engine.clickEnabled.store(metronome.value("enabled", engine.clickEnabled.load()));
   engine.clickVolume.store(metronome.value("volume", engine.clickVolume.load()));
+  engine.clickOutputChannel.store(metronome.value("outputChannel", engine.clickOutputChannel.load()));
   engine.clickBpm.store(metronome.value("bpm", engine.clickBpm.load()));
   engine.clickBeats.store(metronome.value("beats", engine.clickBeats.load()));
 }
@@ -659,6 +749,16 @@ int main(int argc, char** argv) {
     }
     if (argc >= 2 && std::string(argv[1]) == "--test-tempo-sync") {
       const auto result = testTempoSync();
+      std::cout << result.dump() << std::endl;
+      return result.at("passed").get<bool>() ? 0 : 1;
+    }
+    if (argc >= 2 && std::string(argv[1]) == "--test-pitch-protection") {
+      const auto result = testPitchProtection();
+      std::cout << result.dump() << std::endl;
+      return result.at("passed").get<bool>() ? 0 : 1;
+    }
+    if (argc >= 2 && std::string(argv[1]) == "--test-click-routing") {
+      const auto result = testClickRouting();
       std::cout << result.dump() << std::endl;
       return result.at("passed").get<bool>() ? 0 : 1;
     }

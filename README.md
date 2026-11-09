@@ -10,7 +10,7 @@ Reproductor multitrack local para preparar canciones y setlists.
 4. Ejecuta `npm start`. Esto compila el motor de audio nativo antes de abrir la aplicación.
 
 `npm run check` comprueba la sintaxis de JavaScript y compila el motor nativo.
-`npm run test:native` comprueba la preservación del pitch y la detección/sincronización de tempo.
+`npm run test:native` comprueba pitch, sincronización de tempo, protección de pitch para pistas guía y ruteo del click.
 `npm run dist:win` compila el motor y genera un instalador Windows x64 en `dist`.
 
 ## Uso inicial
@@ -26,9 +26,10 @@ Reproductor multitrack local para preparar canciones y setlists.
 - El motor admite audio WAV, MP3, FLAC y OGG/Vorbis. Convierte Opus, AAC/M4A o AIFF antes de importarlos.
 - También puedes crear en **Explorar** una canción solo con click y agregarla a cualquier setlist.
 - Usa reproducir, pausa, detener y la barra de posición desde la mezcla de una canción.
-- Las pistas aparecen como canales verticales; ajusta volumen, paneo, solo y mute por pista.
-- El canal **Click** aparece como otro fader. Su volumen y activación se guardan por canción; el tempo y el compás están junto al visor.
-- Al reproducir, el analizador estima el BPM de cada pista y ajusta su duración al tempo de la canción sin cambiar el tono, cuando detecta un pulso fiable y el ajuste está dentro de un rango razonable.
+- Las pistas aparecen como canales verticales; ajusta volumen, paneo, solo, mute y salida por pista. Desactiva **Pitch canción** en la guía para conservar su tono; seguirá sincronizándose al BPM.
+- El canal **Click** aparece como otro fader y también permite elegir el master o una salida física mono/estéreo. Su nivel de salida es más fuerte y su volumen, activación y ruta se guardan por canción.
+- Usa **MASTER CANCIÓN** para el nivel de las pistas y **MASTER SETLIST** para controlar todo el audio, incluido el click, en todas las canciones de ese setlist.
+- Al reproducir, el analizador estima el BPM de cada pista y ajusta su duración al tempo de la canción sin cambiar el tono, cuando detecta un pulso fiable y el ajuste está dentro de un rango razonable. La opción **Pitch canción** permite mantener el tono original de guías vocales.
 - El pitch se guarda por canción y se procesa para conservar la duración y sincronía de las pistas.
 - Cada canción guarda su propia configuración de click: activación, BPM, compás y volumen.
 - El metrónomo de cada canción, incluida una canción solo con click, sigue hasta que pulses **Detener**.

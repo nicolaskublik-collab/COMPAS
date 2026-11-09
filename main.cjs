@@ -14,7 +14,7 @@ const MUSICAL_KEYS = new Set([
 ]);
 const LIBRARY_FILE = 'library.json';
 const SETTINGS_FILE = 'settings.json';
-const DEFAULT_METRONOME = Object.freeze({ enabled: false, bpm: 120, beats: 4, volume: 0.6 });
+const DEFAULT_METRONOME = Object.freeze({ enabled: false, bpm: 120, beats: 4, volume: 0.6, outputChannel: -1 });
 const DEFAULT_SETTINGS = Object.freeze({
   selectedAudioApi: 'asio',
   selectedAudioDevice: '',
@@ -68,6 +68,9 @@ function validateLibrary(value) {
       || typeof song.metronome.volume !== 'number'
       || song.metronome.volume < 0
       || song.metronome.volume > 1
+      || !Number.isInteger(song.metronome.outputChannel)
+      || song.metronome.outputChannel < -64
+      || song.metronome.outputChannel > 63
       || (song.clickOnly && song.tracks.length !== 0)
       || (!song.clickOnly && song.tracks.length === 0)) {
       throw new Error(`La configuración de «${song.name}» es inválida.`);
@@ -78,14 +81,20 @@ function validateLibrary(value) {
     for (const track of song.tracks) {
       if (!track || typeof track.id !== 'string' || typeof track.name !== 'string'       || !isAudioPath(track.path)
       || (track.outputChannel !== undefined
-        && (!Number.isInteger(track.outputChannel) || track.outputChannel < -64 || track.outputChannel > 63))) {
+        && (!Number.isInteger(track.outputChannel) || track.outputChannel < -64 || track.outputChannel > 63))
+      || typeof track.pitchEnabled !== 'boolean') {
         throw new Error('Hay una pista con datos inválidos.');
       }
     }
   }
 
   for (const setlist of value.setlists) {
-    if (!setlist || typeof setlist.id !== 'string' || typeof setlist.name !== 'string' || !Array.isArray(setlist.songIds)) {
+    if (!setlist || typeof setlist.id !== 'string' || typeof setlist.name !== 'string'
+      || !Array.isArray(setlist.songIds)
+      || typeof setlist.masterVolume !== 'number'
+      || !Number.isFinite(setlist.masterVolume)
+      || setlist.masterVolume < 0
+      || setlist.masterVolume > 1) {
       throw new Error('Hay una lista con datos inválidos.');
     }
     if (setlist.songIds.some((id) => !songIds.has(id))) {
@@ -111,14 +120,26 @@ function migrateLibrary(value) {
         metronome: {
           ...DEFAULT_METRONOME,
           ...(song.metronome ?? {}),
+          outputChannel: Number.isInteger(song.metronome?.outputChannel)
+            && song.metronome.outputChannel >= -64 && song.metronome.outputChannel <= 63
+            ? song.metronome.outputChannel : DEFAULT_METRONOME.outputChannel,
           bpm
         },
         tracks: song.tracks.map(({ pitchSemitones, ...track }) => ({
           outputChannel: -1,
+          pitchEnabled: true,
           ...track
         }))
       };
-    })
+    }),
+    setlists: value.setlists.map((setlist) => ({
+      ...setlist,
+      masterVolume: typeof setlist.masterVolume === 'number'
+        && Number.isFinite(setlist.masterVolume)
+        && setlist.masterVolume >= 0
+        && setlist.masterVolume <= 1
+        ? setlist.masterVolume : 1
+    }))
   };
 }
 
@@ -338,10 +359,19 @@ function validateTrackMix(song, trackMix) {
     if (!item
       || typeof item.volume !== 'number' || !Number.isFinite(item.volume) || item.volume < 0 || item.volume > 1
       || typeof item.pan !== 'number' || !Number.isFinite(item.pan) || item.pan < -1 || item.pan > 1
-      || !Number.isInteger(item.outputChannel) || item.outputChannel < -64 || item.outputChannel > 63) {
+      || !Number.isInteger(item.outputChannel) || item.outputChannel < -64 || item.outputChannel > 63
+      || typeof item.pitchEnabled !== 'boolean') {
       throw new Error('Una pista contiene una asignación de mezcla inválida.');
     }
-    return { id: track.id, name: track.name, path: track.path, volume: item.volume, pan: item.pan, outputChannel: item.outputChannel };
+    return {
+      id: track.id,
+      name: track.name,
+      path: track.path,
+      volume: item.volume,
+      pan: item.pan,
+      outputChannel: item.outputChannel,
+      pitchEnabled: item.pitchEnabled
+    };
   });
 }
 
@@ -355,14 +385,20 @@ async function sendAudioCommand(command) {
   if (command.action === 'play' || command.action === 'mix') {
     const song = library.songs.find((item) => item.id === command.songId);
     if (!song) throw new Error('La canción solicitada ya no está en la biblioteca.');
+    const setlist = library.setlists.find((item) => item.id === command.setlistId && item.songIds.includes(song.id));
+    if (!setlist) throw new Error('Selecciona el setlist que contiene esta canción.');
     const tracks = validateTrackMix(song, command.tracks);
     const masterVolume = command.masterVolume;
     if (typeof masterVolume !== 'number' || !Number.isFinite(masterVolume) || masterVolume < 0 || masterVolume > 1) {
       throw new Error('El volumen maestro no es válido.');
     }
+    const setlistVolume = command.setlistVolume;
+    if (typeof setlistVolume !== 'number' || !Number.isFinite(setlistVolume) || setlistVolume < 0 || setlistVolume > 1) {
+      throw new Error('El volumen maestro del setlist no es válido.');
+    }
     const metronome = song.metronome;
     if (command.action === 'mix') {
-      payload = { action: 'mix', masterVolume, metronome, tracks };
+      payload = { action: 'mix', masterVolume, setlistVolume, metronome, tracks };
     } else {
       const deviceId = Number(settings.selectedAudioDevice);
       if (!Number.isInteger(deviceId) || deviceId < 0) throw new Error('Selecciona un dispositivo de salida en Configuración.');
@@ -381,6 +417,7 @@ async function sendAudioCommand(command) {
         pitchSemitones: song.pitchSemitones,
         targetBpm: song.bpm,
         masterVolume,
+        setlistVolume,
         metronome,
         tracks
       };
@@ -471,7 +508,8 @@ ipcMain.handle('library:import', async (_event, metadata) => {
       pan: 0,
       muted: false,
       solo: false,
-      outputChannel: -1
+      outputChannel: -1,
+      pitchEnabled: true
     }))
   };
   await saveLibrary({ ...library, songs: [...library.songs, song] });

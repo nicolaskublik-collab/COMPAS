@@ -157,7 +157,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .now-playing-badge { display: inline-flex; align-items: center; gap: 7px; margin-left: auto; padding: 7px 9px; border: 1px solid #34412a; border-radius: 6px; color: #b8d890; background: #20271b; font: 8px var(--mono); letter-spacing: .7px; white-space: nowrap; }
 .now-playing-badge span { color: var(--accent); font-size: 7px; }
 
-.transport-panel { display: grid; grid-template-columns: auto minmax(100px, 1fr) minmax(145px, 190px); align-items: center; gap: 23px; min-height: 87px; padding: 14px 18px; margin-top: 13px; border: 1px solid var(--line); border-radius: 10px; background: #151917; }
+.transport-panel { display: grid; grid-template-columns: auto minmax(100px, 1fr) repeat(2, minmax(125px, 175px)); align-items: center; gap: 15px; min-height: 87px; padding: 14px 18px; margin-top: 13px; border: 1px solid var(--line); border-radius: 10px; background: #151917; }
 .transport-controls { display: flex; align-items: center; gap: 9px; }
 .transport-button { display: grid; width: 35px; height: 35px; place-items: center; padding: 0; border: 1px solid #303733; border-radius: 9px; color: #c1c9c2; background: #1c211e; cursor: pointer; transition: .18s ease; }
 .transport-button:hover { border-color: #59694a; color: var(--accent); background: #252c21; }
@@ -324,7 +324,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .transport-panel { grid-template-columns: 1fr auto; gap: 11px 15px; padding: 12px; }
   .transport-controls { grid-column: 1; grid-row: 1; }
   .timeline { grid-column: 1 / -1; grid-row: 2; }
-  .master-control { grid-column: 2; grid-row: 1; width: 150px; }
+  .master-control { grid-column: 1 / -1; width: 100%; }
+  .song-master-control { grid-row: 3; }
+  .setlist-master-control { grid-row: 4; }
   .section-toolbar { margin-top: 23px; }
   .track-legend { grid-template-columns: 70px 26px 37px; gap: 8px; font-size: 7px; }
   .track-row { grid-template-columns: minmax(100px, 1fr) minmax(65px, .75fr) 27px 34px; gap: 8px; padding: 8px; }
@@ -351,8 +353,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .song-art svg { width: 48px; height: 48px; }
   .song-information h2 { font-size: 16px; }
   .song-meta { max-width: 210px; font-size: 10px; }
-  .master-control { width: 126px; grid-template-columns: auto minmax(35px, 1fr) auto; gap: 6px; }
-  .master-control label span { display: none; }
+  .master-control { width: 100%; grid-template-columns: auto minmax(35px, 1fr) auto; gap: 6px; }
+  .master-control label span { display: inline; }
   .track-legend { grid-template-columns: 56px 23px 34px; gap: 6px; }
   .track-row { grid-template-columns: minmax(85px, 1fr) minmax(54px, .65fr) 26px 31px; gap: 6px; }
   .track-name { font-size: 10px; }
@@ -644,6 +646,16 @@ body.settings-active .settings-view { display: block; }
   color: #818b83;
   font: 8px var(--mono);
 }
+.track-pitch-bypass {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  gap: 6px;
+  color: #aeb8af;
+  font-size: 8px;
+}
+.track-pitch-bypass input { width: 12px; height: 12px; margin: 0; accent-color: var(--accent); }
+.track-pitch-bypass small { margin-left: auto; color: #748078; font-size: 7px; }
 .track-output-control select {
   width: 100%;
   min-width: 0;

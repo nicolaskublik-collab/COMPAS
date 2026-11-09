@@ -1,6 +1,6 @@
 {
   "name": "multitracks-live",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "license": "GPL-3.0-only",
   "description": "Reproductor multitrack local para uso en vivo",
@@ -9,7 +9,7 @@
     "build:native": "node scripts/build-native.cjs",
     "start": "npm run build:native && electron .",
     "check": "node --check main.cjs && node --check preload.cjs && node --check renderer.js && node --check scripts/build-native.cjs && npm run build:native",
-    "test:native": "native\\build\\Release\\compas-audio.exe --test-pitch && native\\build\\Release\\compas-audio.exe --test-tempo-sync",
+    "test:native": "native\\build\\Release\\compas-audio.exe --test-pitch && native\\build\\Release\\compas-audio.exe --test-tempo-sync && native\\build\\Release\\compas-audio.exe --test-pitch-protection && native\\build\\Release\\compas-audio.exe --test-click-routing",
     "dist:win": "npm run build:native && electron-builder --win nsis --x64 --publish never"
   },
   "devDependencies": {

@@ -45,6 +45,8 @@ const elements = {
   duration: document.querySelector('[data-duration]'),
   masterVolume: document.querySelector('#master-volume'),
   masterVolumeValue: document.querySelector('[data-master-volume-value]'),
+  setlistMasterVolume: document.querySelector('#setlist-master-volume'),
+  setlistMasterVolumeValue: document.querySelector('[data-setlist-master-volume-value]'),
   trackList: document.querySelector('#track-list'),
   trackCount: document.querySelector('[data-track-count]'),
   status: document.querySelector('#status-message'),
@@ -214,6 +216,10 @@ function setStatus(message) {
 
 function selectedSong() {
   return state.library.songs.find((song) => song.id === state.selectedSongId) ?? null;
+}
+
+function activeSetlist() {
+  return state.library.setlists.find((setlist) => setlist.id === state.activeSetlistId) ?? null;
 }
 
 function formatTime(seconds) {
@@ -595,6 +601,11 @@ function renderTracks() {
             ${renderOutputOptions(track.outputChannel ?? -1)}
           </select>
         </label>
+        <label class="track-pitch-bypass" title="Desactiva esta opción para conservar el tono original de una guía.">
+          <input type="checkbox" data-track-control="pitchEnabled" data-track-id="${escapeText(track.id)}" aria-label="Aplicar pitch de canción a ${escapeText(track.name)}"${track.pitchEnabled === false ? '' : ' checked'}>
+          <span>Pitch canción</span>
+          <small>Desactiva para proteger la guía</small>
+        </label>
       </div>
       <label class="track-control track-volume">
         <span class="track-control-label">Volumen</span>
@@ -631,6 +642,12 @@ function appendClickTrack(song) {
         <div class="track-name">Click</div>
         <div class="track-detail">${song.clickOnly ? 'Solo click' : `${song.metronome.bpm} BPM · ${song.metronome.beats === 6 ? '6/8' : `${song.metronome.beats}/4`}`}</div>
       </div>
+      <label class="track-output-control">
+        <span>Salida</span>
+        <select data-track-control="click-outputChannel" aria-label="Salida del click">
+          ${renderOutputOptions(song.metronome.outputChannel ?? -1)}
+        </select>
+      </label>
     </div>
     <label class="track-control track-volume">
       <span class="track-control-label">Volumen</span>
@@ -646,7 +663,16 @@ function renderAll() {
   renderSongs();
   renderSetlists();
   renderTracks();
+  updateSetlistMasterControl();
   updateCurrentViewLabel();
+}
+
+function updateSetlistMasterControl() {
+  const setlist = activeSetlist();
+  const volume = setlist?.masterVolume ?? 1;
+  elements.setlistMasterVolume.value = String(Math.round(volume * 100));
+  elements.setlistMasterVolume.disabled = !setlist;
+  elements.setlistMasterVolumeValue.value = `${Math.round(volume * 100)}%`;
 }
 
 function updateCurrentViewLabel() {
@@ -896,7 +922,8 @@ function audioTrackMix(song) {
     id: track.id,
     volume: track.muted || (soloActive && !track.solo) ? 0 : track.volume,
     pan: track.pan,
-    outputChannel: track.outputChannel ?? -1
+    outputChannel: track.outputChannel ?? -1,
+    pitchEnabled: track.pitchEnabled !== false
   }));
 }
 
@@ -904,10 +931,14 @@ function sendNativeMix() {
   if (!state.audioPrepared && !state.isPlaying) return;
   const song = selectedSong();
   if (!song) return;
+  const setlist = activeSetlist();
+  if (!setlist) return;
   window.multitracks.audioCommand({
     action: 'mix',
     songId: song.id,
+    setlistId: setlist.id,
     masterVolume: Number(elements.masterVolume.value) / 100,
+    setlistVolume: setlist.masterVolume,
     tracks: audioTrackMix(song)
   }).catch((error) => setStatus(`No se pudo actualizar la mezcla: ${error.message}`));
 }
@@ -972,6 +1003,11 @@ async function startPlayback() {
     setStatus('Primero añade una canción a la biblioteca.');
     return false;
   }
+  const setlist = activeSetlist();
+  if (!setlist || !setlist.songIds.includes(song.id)) {
+    setStatus('Abre el setlist de esta canción antes de reproducirla.');
+    return false;
+  }
   if (!song.clickOnly && song.tracks.length === 0) {
     setStatus('Esta canción no tiene pistas.');
     return false;
@@ -999,8 +1035,10 @@ async function startPlayback() {
   await window.multitracks.audioCommand({
     action: 'play',
     songId: song.id,
+    setlistId: setlist.id,
     startOffsetSeconds: state.offset,
     masterVolume: Number(elements.masterVolume.value) / 100,
+    setlistVolume: setlist.masterVolume,
     tracks: audioTrackMix(song)
   });
   state.startedAt = performance.now() / 1000;
@@ -1289,7 +1327,7 @@ elements.setlistForm.addEventListener('submit', (event) => {
     elements.setlistName.focus();
     return;
   }
-  const setlist = { id: crypto.randomUUID(), name, songIds: [] };
+  const setlist = { id: crypto.randomUUID(), name, songIds: [], masterVolume: 1 };
   state.library.setlists.push(setlist);
   state.activeSetlistId = setlist.id;
   state.selectedSongId = null;
@@ -1337,19 +1375,34 @@ elements.trackList.addEventListener('input', (event) => {
 
   const control = input.dataset.trackControl;
   if (control === 'volume') track.volume = Number(input.value) / 100;
-  if (control === 'pan') track.pan = Number(input.value) / 100;
+  else if (control === 'pan') track.pan = Number(input.value) / 100;
+  else return;
   applyTrackSettings(track);
   scheduleSave();
 });
 
 elements.trackList.addEventListener('change', (event) => {
-  const select = event.target.closest('[data-track-control="outputChannel"]');
-  if (!select) return;
-  const track = selectedSong()?.tracks.find((item) => item.id === select.dataset.trackId);
+  const control = event.target.closest('[data-track-control]');
+  if (!control) return;
+  const song = selectedSong();
+  if (!song) return;
+  if (control.dataset.trackControl === 'click-outputChannel') {
+    song.metronome.outputChannel = Number(control.value);
+    sendNativeMix();
+    scheduleSave();
+    return;
+  }
+  const track = song.tracks.find((item) => item.id === control.dataset.trackId);
   if (!track) return;
-  track.outputChannel = Number(select.value);
-  sendNativeMix();
-  scheduleSave();
+  if (control.dataset.trackControl === 'outputChannel') {
+    track.outputChannel = Number(control.value);
+    sendNativeMix();
+    scheduleSave();
+  } else if (control.dataset.trackControl === 'pitchEnabled') {
+    track.pitchEnabled = control.checked;
+    scheduleSave();
+    reprocessPitchSettings();
+  }
 });
 
 elements.trackList.addEventListener('click', (event) => {
@@ -1452,6 +1505,36 @@ elements.masterVolume.addEventListener('input', () => {
   sendNativeMix();
 });
 
+elements.setlistMasterVolume.addEventListener('input', () => {
+  const setlist = activeSetlist();
+  if (!setlist) return;
+  const value = Number(elements.setlistMasterVolume.value);
+  setlist.masterVolume = value / 100;
+  elements.setlistMasterVolumeValue.value = `${value}%`;
+  sendNativeMix();
+  scheduleSave();
+});
+
+function reprocessPitchSettings() {
+  if (!state.audioPrepared && !state.isPlaying) return;
+  state.offset = currentPosition();
+  window.clearTimeout(state.pitchRefreshTimer);
+  state.pitchRefreshTimer = window.setTimeout(async () => {
+    const offset = state.offset;
+    state.isPlaying = false;
+    state.audioPrepared = false;
+    window.clearInterval(state.timer);
+    state.timer = null;
+    state.offset = offset;
+    setTransportButton(false);
+    try {
+      await startPlayback();
+    } catch (error) {
+      setStatus(`No se pudo aplicar el pitch: ${error.message}`);
+    }
+  }, 350);
+}
+
 elements.songPitch.addEventListener('input', () => {
   const song = selectedSong();
   if (!song) return;
@@ -1459,24 +1542,7 @@ elements.songPitch.addEventListener('input', () => {
   elements.songPitchValue.value = `${song.pitchSemitones > 0 ? '+' : ''}${song.pitchSemitones} st`;
   updateSongDuration();
   scheduleSave();
-  if (state.audioPrepared || state.isPlaying) {
-    state.offset = currentPosition();
-    window.clearTimeout(state.pitchRefreshTimer);
-    state.pitchRefreshTimer = window.setTimeout(async () => {
-      try {
-        const offset = state.offset;
-        state.isPlaying = false;
-        state.audioPrepared = false;
-        window.clearInterval(state.timer);
-        state.timer = null;
-        state.offset = offset;
-        setTransportButton(false);
-        await startPlayback();
-      } catch (error) {
-        setStatus(`No se pudo aplicar el pitch: ${error.message}`);
-      }
-    }, 350);
-  }
+  reprocessPitchSettings();
 });
 
 elements.clickBpm.addEventListener('change', () => {

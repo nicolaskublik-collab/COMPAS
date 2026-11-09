@@ -192,13 +192,18 @@
               <input id="progress-bar" class="range-input progress-range" type="range" min="0" max="100" value="0" aria-label="Posición de reproducción">
               <span class="timeline-end" data-duration aria-label="Duración total">--:--</span>
             </div>
-            <div class="master-control">
+            <div class="master-control song-master-control">
               <label for="master-volume">
                 <svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><path d="M3 8v4h3l4 3V5L6 8H3Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M13 7.2a4 4 0 0 1 0 5.6M15.5 5a7.1 7.1 0 0 1 0 10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-                <span>MASTER</span>
+                <span>CANCIÓN</span>
               </label>
-              <input id="master-volume" class="range-input volume-range" type="range" min="0" max="100" value="80" aria-label="Volumen maestro">
+              <input id="master-volume" class="range-input volume-range" type="range" min="0" max="100" value="80" aria-label="Volumen maestro de la canción">
               <output class="volume-value" data-master-volume-value>80%</output>
+            </div>
+            <div class="master-control setlist-master-control">
+              <label for="setlist-master-volume"><span>SETLIST</span></label>
+              <input id="setlist-master-volume" class="range-input volume-range" type="range" min="0" max="100" value="100" aria-label="Volumen maestro de todo el setlist">
+              <output class="volume-value" data-setlist-master-volume-value>100%</output>
             </div>
           </section>
 
@@ -502,7 +507,7 @@
               <output data-song-pitch-value for="song-pitch">0 st</output>
             </div>
             <input id="song-pitch" class="range-input" type="range" min="-12" max="12" step="1" value="0" aria-label="Pitch de la canción para todas las pistas, en semitonos">
-            <p>Afecta a todas las pistas y conserva la duración. Preparar un cambio de tono puede tardar según la canción.</p>
+            <p>Afecta a las pistas con Pitch canción activado y conserva la duración. Click y guías protegidas mantienen su tono.</p>
           </div>
           <div class="session-detail"><span>Formato</span><strong>Multitrack</strong></div>
           <div class="session-detail"><span>Ruteo</span><strong><span class="output-indicator" aria-hidden="true"></span>Master o salida por pista</strong></div>
