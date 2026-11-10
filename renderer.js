@@ -124,6 +124,12 @@ const state = {
   trackTempoAnalysis: [],
   waveformDuration: 0,
   waveformLastDraw: 0,
+  waveformRevision: 0,
+  waveformBitmap: null,
+  waveformBitmapKey: '',
+  waveformPendingKey: '',
+  waveformFailedKey: '',
+  waveformWorker: null,
   pendingSongSwitch: null,
   lastCacheWarning: ''
 };
@@ -131,6 +137,61 @@ const state = {
 if (!window.location.hash) window.location.hash = 'setlists-view';
 
 const TRACK_COLORS = ['#c1f06b', '#e9a86e', '#92a7ea', '#d28de1', '#77c9b9', '#ec8585'];
+
+function waveformKey(width, height, scale) {
+  return `${state.selectedSongId ?? ''}:${state.waveformRevision}:${width}:${height}:${scale}`;
+}
+
+function currentWaveformKey() {
+  const bounds = elements.waveformCanvas.getBoundingClientRect();
+  const scale = Math.min(2, window.devicePixelRatio || 1);
+  return waveformKey(Math.round(bounds.width * scale), Math.round(bounds.height * scale), scale);
+}
+
+function requestWaveformRender(width, height, scale, key) {
+  if (!state.waveformTracks.length || state.waveformBitmapKey === key
+    || state.waveformPendingKey === key || state.waveformFailedKey === key) return;
+  if (!state.waveformWorker) {
+    state.waveformWorker = new Worker(new URL('./waveform-worker.js', import.meta.url), { type: 'module' });
+    state.waveformWorker.addEventListener('message', (event) => {
+      const { key: responseKey, bitmap, error } = event.data;
+      if (state.waveformPendingKey === responseKey) state.waveformPendingKey = '';
+      if (responseKey !== currentWaveformKey()) {
+        bitmap?.close();
+        return;
+      }
+      if (error) {
+        state.waveformFailedKey = responseKey;
+        elements.waveformStatus.textContent = `Error de forma de onda: ${error}`;
+        return;
+      }
+      if (!(bitmap instanceof ImageBitmap)) {
+        state.waveformFailedKey = responseKey;
+        elements.waveformStatus.textContent = 'El worker no devolvió una forma de onda válida.';
+        return;
+      }
+      state.waveformBitmap?.close();
+      state.waveformBitmap = bitmap;
+      state.waveformBitmapKey = responseKey;
+      drawWaveform(true);
+    });
+    state.waveformWorker.addEventListener('error', (event) => {
+      state.waveformFailedKey = state.waveformPendingKey;
+      state.waveformPendingKey = '';
+      elements.waveformStatus.textContent = `Error al preparar la forma de onda: ${event.message}`;
+    });
+  }
+  state.waveformPendingKey = key;
+  state.waveformFailedKey = '';
+  state.waveformWorker.postMessage({
+    key,
+    tracks: state.waveformTracks,
+    width,
+    height,
+    scale,
+    duration: state.waveformDuration
+  });
+}
 
 function drawWaveform(force = false) {
   const canvas = elements.waveformCanvas;
@@ -151,16 +212,22 @@ function drawWaveform(force = false) {
   const context = canvas.getContext('2d');
   context.setTransform(scale, 0, 0, scale, 0, 0);
   context.clearRect(0, 0, bounds.width, bounds.height);
-  context.fillStyle = '#111513';
-  context.fillRect(0, 0, bounds.width, bounds.height);
+  const rows = state.waveformTracks;
+  const song = selectedSong();
+  const key = waveformKey(width, height, scale);
+  if (rows.length) requestWaveformRender(width, height, scale, key);
+  if (state.waveformBitmap && state.waveformBitmapKey === key) {
+    context.drawImage(state.waveformBitmap, 0, 0, bounds.width, bounds.height);
+  } else {
+    context.fillStyle = '#111513';
+    context.fillRect(0, 0, bounds.width, bounds.height);
+  }
 
   const left = 54;
   const right = bounds.width - 12;
   const top = 10;
   const bottom = bounds.height - 19;
   const plotWidth = Math.max(0, right - left);
-  const rows = state.waveformTracks;
-  const song = selectedSong();
   if (state.waveformDuration > 0 && song) {
     for (const region of song.regions ?? []) {
       const start = left + plotWidth * Math.min(1, region.start / state.waveformDuration);
@@ -179,54 +246,6 @@ function drawWaveform(force = false) {
       : 'Pulsa Reproducir para preparar el espectro de las pistas.',
     bounds.width / 2, bounds.height / 2);
     return;
-  }
-
-  const rowHeight = (bottom - top) / rows.length;
-  context.font = '9px Segoe UI, sans-serif';
-  rows.forEach((track, rowIndex) => {
-    const rowTop = top + rowIndex * rowHeight;
-    const center = rowTop + rowHeight / 2;
-    context.fillStyle = '#9aa49b';
-    context.textAlign = 'right';
-    context.textBaseline = 'middle';
-    const label = track.name.length > 10 ? `${track.name.slice(0, 9)}…` : track.name;
-    context.fillText(label, left - 8, center, left - 12);
-    context.strokeStyle = '#29312c';
-    context.lineWidth = 1;
-    context.beginPath();
-    context.moveTo(left, center);
-    context.lineTo(right, center);
-    context.stroke();
-
-    const values = track.values;
-    if (!Array.isArray(values) || values.length === 0 || plotWidth <= 0) return;
-    const amplitude = Math.max(2, Math.min(12, rowHeight * 0.43));
-    context.strokeStyle = TRACK_COLORS[rowIndex % TRACK_COLORS.length];
-    context.globalAlpha = 0.9;
-    context.beginPath();
-    for (let x = 0; x < Math.floor(plotWidth); x += 1) {
-      const bin = Math.min(values.length - 1, Math.floor(x * values.length / plotWidth));
-      const level = Math.min(1, Math.sqrt(Math.max(0, values[bin])));
-      const half = level * amplitude;
-      context.moveTo(left + x + 0.5, center - half);
-      context.lineTo(left + x + 0.5, center + half);
-    }
-    context.stroke();
-    context.globalAlpha = 1;
-  });
-
-  for (let index = 0; index <= 4; index += 1) {
-    const x = left + plotWidth * index / 4;
-    context.strokeStyle = '#ffffff10';
-    context.beginPath();
-    context.moveTo(x, top);
-    context.lineTo(x, bottom);
-    context.stroke();
-    context.fillStyle = '#758077';
-    context.font = '8px Consolas, monospace';
-    context.textAlign = index === 0 ? 'left' : index === 4 ? 'right' : 'center';
-    context.textBaseline = 'bottom';
-    context.fillText(formatTime(state.waveformDuration * index / 4), x, bounds.height - 1);
   }
 
   if (state.waveformDuration > 0) {
@@ -773,9 +792,9 @@ function renderTracks() {
             ${renderOutputOptions(track.outputChannel ?? -1)}
           </select>
         </label>
-        <label class="track-pitch-bypass" title="Desactiva esta opción para conservar el tono original de una guía.">
-          <input type="checkbox" data-track-control="pitchEnabled" data-track-id="${escapeText(track.id)}" aria-label="Aplicar pitch de canción a ${escapeText(track.name)}"${track.pitchEnabled === false ? '' : ' checked'}>
-          <span>Pitch canción</span>
+        <label class="track-pitch-bypass" title="Desactiva para excluir esta pista del pitch y la sincronización de tempo.">
+          <input type="checkbox" data-track-control="pitchEnabled" data-track-id="${escapeText(track.id)}" aria-label="Aplicar DSP de canción a ${escapeText(track.name)}"${track.pitchEnabled === false ? '' : ' checked'}>
+          <span>DSP canción</span>
           <small>Desactiva para proteger la guía</small>
         </label>
       </div>
@@ -860,6 +879,10 @@ function updateCurrentViewLabel() {
 }
 
 window.addEventListener('hashchange', updateCurrentViewLabel);
+window.addEventListener('beforeunload', () => {
+  state.waveformWorker?.terminate();
+  state.waveformBitmap?.close();
+});
 
 function renderOutputOptions(selectedChannel) {
   const selected = Number.isInteger(selectedChannel) ? selectedChannel : -1;
@@ -2172,14 +2195,21 @@ window.multitracks.onAudioEvent((event) => {
     renderSetlists();
     const song = selectedSong();
     const sampleRate = Number(event.sampleRate) || 48000;
+    state.waveformRevision += 1;
+    state.waveformPendingKey = '';
+    state.waveformFailedKey = '';
     state.duration = song?.clickOnly ? 0 : Number(event.durationFrames) / sampleRate;
     state.waveformDuration = state.duration;
     state.waveformTracks = Array.isArray(event.waveforms)
       ? event.waveforms.filter((track) => track
         && typeof track.id === 'string'
         && typeof track.name === 'string'
-        && Array.isArray(track.values)
-        && track.values.every((value) => Number.isFinite(value) && value >= 0 && value <= 1))
+        && Array.isArray(track.minimum)
+        && Array.isArray(track.maximum)
+        && track.minimum.length > 0
+        && track.maximum.length === track.minimum.length
+        && track.minimum.every((value) => Number.isFinite(value) && value >= -1 && value <= 1)
+        && track.maximum.every((value) => Number.isFinite(value) && value >= -1 && value <= 1))
       : [];
     state.trackTempoAnalysis = Array.isArray(event.trackAnalysis)
       ? event.trackAnalysis.filter((track) => track

@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -36,7 +37,8 @@ struct AudioTrack {
   double analyzedBpm{0.0};
   double tempoConfidence{0.0};
   bool tempoSynced{false};
-  std::vector<float> waveform;
+  std::vector<float> waveformMinimum;
+  std::vector<float> waveformMaximum;
   bool cacheHit{false};
   std::string cacheWarning;
   std::atomic<float> volume{1.0F};
@@ -300,6 +302,10 @@ int effectivePitch(int semitones, bool enabled) {
   return enabled ? semitones : 0;
 }
 
+double effectiveDurationRatio(double durationRatio, bool dspEnabled) {
+  return dspEnabled ? durationRatio : 1.0;
+}
+
 void addRoutedClick(float* output, unsigned int outputChannels, int route, float sample) {
   if (route >= 0) {
     if (static_cast<unsigned int>(route) < outputChannels) {
@@ -378,8 +384,8 @@ json testPitchProtection() {
     testTrack.samples[frame * kChannels + 1] = sample;
   }
   constexpr double durationRatio = 0.9;
-  const size_t expectedFrames = static_cast<size_t>(std::llround(frames * durationRatio));
-  processTrack(testTrack, effectivePitch(12, testTrack.pitchEnabled), durationRatio, kSampleRate);
+  processTrack(testTrack, effectivePitch(12, testTrack.pitchEnabled),
+    effectiveDurationRatio(durationRatio, testTrack.pitchEnabled), kSampleRate);
   size_t crossings = 0;
   constexpr size_t startFrame = 10000;
   constexpr size_t endFrame = 40000;
@@ -392,11 +398,12 @@ json testPitchProtection() {
   const double measuredFrequency = static_cast<double>(crossings) * kSampleRate / (endFrame - startFrame);
   return {
     {"passed", std::abs(measuredFrequency - inputFrequency) < 20.0
-      && testTrack.samples.size() == expectedFrames * kChannels},
+      && testTrack.samples.size() == frames * kChannels},
     {"inputHz", inputFrequency},
     {"outputHz", measuredFrequency},
     {"inputFrames", frames},
-    {"outputFrames", testTrack.samples.size() / kChannels}
+    {"outputFrames", testTrack.samples.size() / kChannels},
+    {"expectedFrames", frames}
   };
 }
 
@@ -416,7 +423,7 @@ json testClickRouting() {
 }
 
 constexpr size_t kWaveformBins = 1024;
-constexpr char kCacheMagic[] = "COMPAS01";
+constexpr char kCacheMagic[] = "COMPAS02";
 
 struct TrackCacheHeader {
   char magic[8]{};
@@ -428,27 +435,37 @@ struct TrackCacheHeader {
   uint64_t frameCount{0};
 };
 
-std::vector<float> makeWaveform(const std::vector<float>& samples) {
-  std::vector<double> powers(kWaveformBins, 0.0);
-  std::vector<uint64_t> counts(kWaveformBins, 0);
+struct WaveformPeaks {
+  std::vector<float> minimum;
+  std::vector<float> maximum;
+};
+
+WaveformPeaks makeWaveform(const std::vector<float>& samples) {
+  WaveformPeaks peaks{
+    std::vector<float>(kWaveformBins, std::numeric_limits<float>::max()),
+    std::vector<float>(kWaveformBins, std::numeric_limits<float>::lowest())
+  };
   const size_t frameCount = samples.size() / kChannels;
   for (size_t frame = 0; frame < frameCount; ++frame) {
     const size_t bin = std::min(kWaveformBins - 1, frame * kWaveformBins / frameCount);
-    const double left = samples[frame * kChannels];
-    const double right = samples[frame * kChannels + 1];
-    powers[bin] += (left * left + right * right) * 0.5;
-    ++counts[bin];
+    const float left = samples[frame * kChannels];
+    const float right = samples[frame * kChannels + 1];
+    peaks.minimum[bin] = std::min(peaks.minimum[bin], std::min(left, right));
+    peaks.maximum[bin] = std::max(peaks.maximum[bin], std::max(left, right));
   }
-  double peakPower = 0.0;
+  float peak = 0.0F;
   for (size_t bin = 0; bin < kWaveformBins; ++bin) {
-    if (counts[bin] != 0) powers[bin] /= static_cast<double>(counts[bin]);
-    peakPower = std::max(peakPower, powers[bin]);
+    if (peaks.minimum[bin] == std::numeric_limits<float>::max()) peaks.minimum[bin] = 0.0F;
+    if (peaks.maximum[bin] == std::numeric_limits<float>::lowest()) peaks.maximum[bin] = 0.0F;
+    peak = std::max(peak, std::max(std::abs(peaks.minimum[bin]), std::abs(peaks.maximum[bin])));
   }
-  std::vector<float> values(kWaveformBins, 0.0F);
-  for (size_t bin = 0; bin < kWaveformBins; ++bin) {
-    values[bin] = peakPower > 0.0 ? static_cast<float>(powers[bin] / peakPower) : 0.0F;
+  if (peak > 0.0F) {
+    for (size_t bin = 0; bin < kWaveformBins; ++bin) {
+      peaks.minimum[bin] /= peak;
+      peaks.maximum[bin] /= peak;
+    }
   }
-  return values;
+  return peaks;
 }
 
 bool readTrackCache(AudioTrack& track, const std::string& cacheDirectory, const std::string& cacheKey,
@@ -475,24 +492,32 @@ bool readTrackCache(AudioTrack& track, const std::string& cacheDirectory, const 
     track.cacheWarning = "La caché de «" + track.name + "» no es válida; se analizará de nuevo.";
     return false;
   }
-  track.waveform.resize(header.waveformBins);
+  track.waveformMinimum.resize(header.waveformBins);
+  track.waveformMaximum.resize(header.waveformBins);
   track.samples.resize(static_cast<size_t>(header.frameCount) * kChannels);
-  if (!input.read(reinterpret_cast<char*>(track.waveform.data()),
-                  static_cast<std::streamsize>(track.waveform.size() * sizeof(float)))
+  if (!input.read(reinterpret_cast<char*>(track.waveformMinimum.data()),
+                  static_cast<std::streamsize>(track.waveformMinimum.size() * sizeof(float)))
+      || !input.read(reinterpret_cast<char*>(track.waveformMaximum.data()),
+                     static_cast<std::streamsize>(track.waveformMaximum.size() * sizeof(float)))
       || !input.read(reinterpret_cast<char*>(track.samples.data()),
                      static_cast<std::streamsize>(track.samples.size() * sizeof(float)))) {
-    track.waveform.clear();
+    track.waveformMinimum.clear();
+    track.waveformMaximum.clear();
     track.samples.clear();
     track.cacheWarning = "La caché de «" + track.name + "» está incompleta; se analizará de nuevo.";
     return false;
   }
-  if (std::any_of(track.waveform.begin(), track.waveform.end(), [](float value) {
-        return !std::isfinite(value) || value < 0.0F || value > 1.0F;
+  if (std::any_of(track.waveformMinimum.begin(), track.waveformMinimum.end(), [](float value) {
+        return !std::isfinite(value) || value < -1.0F || value > 1.0F;
+      })
+      || std::any_of(track.waveformMaximum.begin(), track.waveformMaximum.end(), [](float value) {
+        return !std::isfinite(value) || value < -1.0F || value > 1.0F;
       })
       || std::any_of(track.samples.begin(), track.samples.end(), [](float value) {
         return !std::isfinite(value);
       })) {
-    track.waveform.clear();
+    track.waveformMinimum.clear();
+    track.waveformMaximum.clear();
     track.samples.clear();
     track.cacheWarning = "La caché de «" + track.name + "» contiene datos inválidos; se analizará de nuevo.";
     return false;
@@ -520,7 +545,7 @@ void writeTrackCache(const AudioTrack& track, const std::string& cacheDirectory,
   std::copy(std::begin(kCacheMagic), std::end(kCacheMagic) - 1, header.magic);
   std::copy(cacheKey.begin(), cacheKey.end(), header.key);
   header.sampleRate = sampleRate;
-  header.waveformBins = static_cast<uint32_t>(track.waveform.size());
+  header.waveformBins = static_cast<uint32_t>(track.waveformMinimum.size());
   header.analyzedBpm = track.analyzedBpm;
   header.tempoConfidence = track.tempoConfidence;
   header.frameCount = track.samples.size() / kChannels;
@@ -529,8 +554,10 @@ void writeTrackCache(const AudioTrack& track, const std::string& cacheDirectory,
     std::ofstream output(temporaryPath, std::ios::binary | std::ios::trunc);
     if (!output
         || !output.write(reinterpret_cast<const char*>(&header), sizeof(header))
-        || !output.write(reinterpret_cast<const char*>(track.waveform.data()),
-                         static_cast<std::streamsize>(track.waveform.size() * sizeof(float)))
+        || !output.write(reinterpret_cast<const char*>(track.waveformMinimum.data()),
+                         static_cast<std::streamsize>(track.waveformMinimum.size() * sizeof(float)))
+        || !output.write(reinterpret_cast<const char*>(track.waveformMaximum.data()),
+                         static_cast<std::streamsize>(track.waveformMaximum.size() * sizeof(float)))
         || !output.write(reinterpret_cast<const char*>(track.samples.data()),
                          static_cast<std::streamsize>(track.samples.size() * sizeof(float)))
         || !output.flush()) {
@@ -563,7 +590,13 @@ json testTrackCache() {
     original.samples[frame * kChannels] = sample;
     original.samples[frame * kChannels + 1] = sample;
   }
-  original.waveform = makeWaveform(original.samples);
+  const auto originalWaveform = makeWaveform(original.samples);
+  original.waveformMinimum = originalWaveform.minimum;
+  original.waveformMaximum = originalWaveform.maximum;
+  const bool hasBipolarPeaks = std::any_of(original.waveformMinimum.begin(), original.waveformMinimum.end(),
+      [](float value) { return value < -0.9F; })
+    && std::any_of(original.waveformMaximum.begin(), original.waveformMaximum.end(),
+      [](float value) { return value > 0.9F; });
   const std::string key(64, 'a');
   std::string warning;
   writeTrackCache(original, directory.u8string(), key, kSampleRate, warning);
@@ -571,13 +604,16 @@ json testTrackCache() {
   restored.name = original.name;
   const bool loaded = readTrackCache(restored, directory.u8string(), key, kSampleRate);
   const bool passed = warning.empty() && loaded && restored.cacheHit
-    && restored.samples == original.samples && restored.waveform == original.waveform
+    && hasBipolarPeaks
+    && restored.samples == original.samples
+    && restored.waveformMinimum == original.waveformMinimum
+    && restored.waveformMaximum == original.waveformMaximum
     && restored.analyzedBpm == original.analyzedBpm;
   std::error_code fileError;
   std::filesystem::remove(directory / (key + ".cmpcache"), fileError);
   fileError.clear();
   std::filesystem::remove(directory, fileError);
-  return {{"passed", passed}, {"cacheHit", loaded}, {"waveformBins", restored.waveform.size()}};
+  return {{"passed", passed},   {"cacheHit", loaded}, {"waveformBins", restored.waveformMinimum.size()}};
 }
 
 json testTransitionFade() {
@@ -633,18 +669,21 @@ std::unique_ptr<AudioTrack> loadTrack(const json& request, int semitones, unsign
     const auto estimate = analyzeTempo(track->samples, targetRate);
     track->analyzedBpm = estimate.bpm;
     track->tempoConfidence = estimate.confidence;
-    track->waveform = makeWaveform(track->samples);
+    auto waveform = makeWaveform(track->samples);
+    track->waveformMinimum = std::move(waveform.minimum);
+    track->waveformMaximum = std::move(waveform.maximum);
     writeTrackCache(*track, cacheDirectory, cacheKey, targetRate, track->cacheWarning);
   }
   double durationRatio = 1.0;
-  if (track->analyzedBpm > 0.0 && targetBpm >= 30.0 && targetBpm <= 300.0) {
+  if (track->pitchEnabled && track->analyzedBpm > 0.0 && targetBpm >= 30.0 && targetBpm <= 300.0) {
     const double candidateRatio = track->analyzedBpm / targetBpm;
     if (candidateRatio >= 0.75 && candidateRatio <= 1.5) {
       durationRatio = candidateRatio;
       track->tempoSynced = true;
     }
   }
-  processTrack(*track, effectivePitch(semitones, track->pitchEnabled), durationRatio, targetRate);
+  processTrack(*track, effectivePitch(semitones, track->pitchEnabled),
+    effectiveDurationRatio(durationRatio, track->pitchEnabled), targetRate);
   return track;
 }
 
@@ -832,9 +871,12 @@ void startPlayback(AudioEngine& engine, const json& request) {
     const int route = track->outputChannel.load();
     requiredChannels = std::max(requiredChannels, routedChannelCount(route));
 
-    json values = json::array();
-    for (const float value : track->waveform) values.push_back(value);
-    waveforms.push_back({{"id", track->id}, {"name", track->name}, {"values", std::move(values)}});
+    json minimum = json::array();
+    json maximum = json::array();
+    for (const float value : track->waveformMinimum) minimum.push_back(value);
+    for (const float value : track->waveformMaximum) maximum.push_back(value);
+    waveforms.push_back({{"id", track->id}, {"name", track->name},
+      {"minimum", std::move(minimum)}, {"maximum", std::move(maximum)}});
     trackAnalysis.push_back({
       {"id", track->id},
       {"bpm", track->analyzedBpm},

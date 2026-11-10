@@ -22,7 +22,7 @@ Reproductor multitrack local para preparar canciones y setlists.
 - Cambia de canción desde la cola o con las flechas del teclado. El motor prepara la siguiente mientras suena la actual y hace una transición corta entre ambas sin cerrar el dispositivo.
 - El botón «Setlist actual» abre rápidamente el detalle de la lista seleccionada.
 - Usa **Exportar setlist** para guardar un archivo `.compas` con el orden, la mezcla y las rutas relativas de las pistas; al exportar, elige una carpeta raíz que contenga todos los stems. **Importar .compas** incorpora una copia del setlist y, si las pistas no se encuentran, permite elegir otra carpeta raíz conservando la estructura de subcarpetas.
-- El visor muestra la forma de onda RMS; haz clic sobre ella para buscar. Agrega puntos, marca inicio y fin de regiones y activa la repetición de una región.
+- El visor muestra picos de forma de onda por pista calculados y cacheados al decodificar el audio. Un Web Worker prepara el dibujo fuera del hilo principal; haz clic en el visor para buscar. Agrega puntos, marca inicio y fin de regiones y activa la repetición de una región.
 - El transporte conserva el contador, Play/Pausa, Reiniciar y Detener; la posición se cambia desde el visor de onda.
 - Por defecto, Espacio reproduce/pausa, las flechas recorren el setlist y los números 1–9 abren esa posición. En Configuración, Key Learn permite personalizar teclas del teclado integrado o externo.
 - En **Explorar**, importa canciones con nombre, artista, BPM (30–300) y tonalidad americana —mayor o menor— y selecciona todas sus pistas.
@@ -31,10 +31,10 @@ Reproductor multitrack local para preparar canciones y setlists.
 - El motor admite audio WAV, MP3, FLAC y OGG/Vorbis. Convierte Opus, AAC/M4A o AIFF antes de importarlos.
 - También puedes crear en **Explorar** una canción solo con click y agregarla a cualquier setlist.
 - Usa reproducir, pausa, detener y la barra de posición desde la mezcla de una canción.
-- Las pistas aparecen como canales verticales; ajusta volumen, paneo, solo, mute y salida por pista. Desactiva **Pitch canción** en la guía para conservar su tono; seguirá sincronizándose al BPM.
+- Las pistas aparecen como canales verticales; ajusta volumen, paneo, solo, mute y salida por pista. Desactiva **DSP canción** en una guía para excluirla tanto del pitch como del time-stretch. El click también permanece fuera de la cadena DSP.
 - El canal **Click** aparece como otro fader y también permite elegir el master o una salida física mono/estéreo. Su nivel de salida es más fuerte y su volumen, activación y ruta se guardan por canción.
 - Usa **MASTER CANCIÓN** para el nivel de las pistas y **MASTER SETLIST** para controlar todo el audio, incluido el click, en todas las canciones de ese setlist.
-- Al reproducir, el analizador estima el BPM de cada pista y ajusta su duración al tempo de la canción sin cambiar el tono, cuando detecta un pulso fiable y el ajuste está dentro de un rango razonable. La opción **Pitch canción** permite mantener el tono original de guías vocales.
+- Al reproducir, el analizador estima el BPM de cada pista y ajusta su duración al tempo de la canción sin cambiar el tono, cuando detecta un pulso fiable y el ajuste está dentro de un rango razonable. La opción **DSP canción** controla si se aplican pitch y sincronización de tempo a cada pista.
 - Elige la tonalidad destino desde la tonalidad original de la canción; el pitch se procesa para conservar la duración y sincronía.
 - Cada canción guarda su propia configuración de click: activación, BPM, compás y volumen.
 - El metrónomo de cada canción, incluida una canción solo con click, sigue hasta que pulses **Detener**.
@@ -52,7 +52,7 @@ Para continuar el proyecto desde otra PC, clona el repositorio, instala Node.js 
 
 ## Alcance actual
 
-El motor nativo usa RtAudio para ASIO/WASAPI, miniaudio para decodificar audio y Signalsmith Stretch para cambiar el pitch sin cambiar la duración. Las fuentes y licencias están en `native/vendor`; el proyecto se distribuye bajo GPLv3. El cambio de tono requiere tiempo de preparación al iniciar la canción y el consumo de CPU depende de la cantidad de pistas.
+El motor nativo usa RtAudio para ASIO/WASAPI, miniaudio para decodificar audio y Signalsmith Stretch para cambiar el pitch sin cambiar la duración. Para conservar el ruteo y los faders independientes, el pitch/time-stretch todavía se procesa por pista; el bus DSP compartido no está implementado aún. Las fuentes y licencias están en `native/vendor`; el proyecto se distribuye bajo GPLv3. El cambio de tono requiere tiempo de preparación al iniciar la canción y el consumo de CPU depende de la cantidad de pistas.
 
 MIDI Learn usa Web MIDI cuando Windows y el dispositivo lo permiten; debe probarse con el controlador real. Antes de usarla en un servicio, prueba las canciones, la sincronía y los niveles con tu equipo de audio.
 
