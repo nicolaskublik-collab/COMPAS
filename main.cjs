@@ -628,6 +628,184 @@ ipcMain.handle('library:delete-song', async (_event, songId) => {
   return library;
 });
 
+ipcMain.handle('setlist:export', async (_event, setlistId) => {
+  const setlist = library.setlists.find((item) => item.id === setlistId);
+  if (!setlist) throw new Error('Selecciona un setlist válido para exportar.');
+
+  const songs = setlist.songIds.map((id) => library.songs.find((song) => song.id === id));
+  if (songs.some((song) => !song)) throw new Error('El setlist contiene una canción que ya no está en la biblioteca.');
+  const tracks = songs.flatMap((song) => song.tracks);
+  let rootDirectory = '';
+
+  if (tracks.length > 0) {
+    const rootResult = await dialog.showOpenDialog(window, {
+      title: 'Selecciona la carpeta raíz que contiene las pistas',
+      properties: ['openDirectory']
+    });
+    if (rootResult.canceled || rootResult.filePaths.length === 0) return null;
+    rootDirectory = path.resolve(rootResult.filePaths[0]);
+  }
+
+  const exportedSongs = [];
+  for (const song of songs) {
+    const exportedTracks = [];
+    for (const track of song.tracks) {
+      const absolutePath = path.resolve(track.path);
+      if (rootDirectory) {
+        const relativePath = path.relative(rootDirectory, absolutePath);
+        if (!relativePath || relativePath === '..' || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath)) {
+          throw new Error(`La pista «${track.name}» no está dentro de la carpeta raíz seleccionada.`);
+        }
+        try {
+          const stat = await fs.stat(absolutePath);
+          if (!stat.isFile()) throw new Error('no es un archivo');
+        } catch (error) {
+          throw new Error(`No se puede exportar «${track.name}»: ${error.message}`);
+        }
+        exportedTracks.push({ ...track, relativePath });
+      } else {
+        exportedTracks.push({ ...track, relativePath: '' });
+      }
+    }
+    exportedSongs.push({ ...song, tracks: exportedTracks });
+  }
+
+  const defaultName = `${setlist.name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')}.compas`;
+  const saveResult = await dialog.showSaveDialog(window, {
+    title: 'Exportar setlist Compás',
+    defaultPath: defaultName,
+    filters: [{ name: 'Setlist Compás', extensions: ['compas'] }]
+  });
+  if (saveResult.canceled || !saveResult.filePath) return null;
+
+  const document = {
+    format: 'compas-setlist',
+    version: 1,
+    setlist,
+    songs: exportedSongs
+  };
+  await fs.writeFile(saveResult.filePath, JSON.stringify(document, null, 2), 'utf8');
+  return saveResult.filePath;
+});
+
+ipcMain.handle('setlist:import', async () => {
+  const openResult = await dialog.showOpenDialog(window, {
+    title: 'Importar setlist Compás',
+    properties: ['openFile'],
+    filters: [{ name: 'Setlist Compás', extensions: ['compas'] }]
+  });
+  if (openResult.canceled || openResult.filePaths.length === 0) return null;
+
+  let document;
+  try {
+    document = JSON.parse(await fs.readFile(openResult.filePaths[0], 'utf8'));
+  } catch (error) {
+    throw new Error(`No se pudo leer el setlist: ${error.message}`);
+  }
+  if (!document || document.format !== 'compas-setlist' || document.version !== 1
+    || !document.setlist || typeof document.setlist.id !== 'string'
+    || typeof document.setlist.name !== 'string' || !Array.isArray(document.setlist.songIds)
+    || !Array.isArray(document.songs)
+    || document.songs.some((song) => !song || typeof song.id !== 'string'
+      || typeof song.name !== 'string' || !Array.isArray(song.tracks))) {
+    throw new Error('El archivo no es un setlist Compás compatible.');
+  }
+
+  const sourceIds = new Set(document.songs.map((song) => song?.id));
+  if (sourceIds.size !== document.songs.length
+    || document.setlist.songIds.some((id) => !sourceIds.has(id))) {
+    throw new Error('El archivo contiene un setlist con canciones inválidas.');
+  }
+
+  const trackEntries = document.songs.flatMap((song) => (Array.isArray(song?.tracks) ? song.tracks : []));
+  let resolvedTracks = new Map();
+  if (trackEntries.length > 0) {
+    const missingTracks = [];
+    for (const track of trackEntries) {
+      if (!track || typeof track.id !== 'string' || typeof track.relativePath !== 'string'
+        || !track.relativePath || path.isAbsolute(track.relativePath)
+        || path.normalize(track.relativePath).split(path.sep).some((part) => part === '..')
+        || !PLAYABLE_AUDIO_EXTENSIONS.has(path.extname(track.relativePath).toLowerCase())) {
+        throw new Error('El archivo del setlist contiene una ruta de pista inválida.');
+      }
+      if (isAudioPath(track.path)) {
+        try {
+          const stat = await fs.stat(track.path);
+          if (stat.isFile()) {
+            resolvedTracks.set(track, track.path);
+            continue;
+          }
+        } catch (error) {
+          if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error;
+        }
+      }
+      missingTracks.push(track);
+    }
+
+    while (missingTracks.length > 0) {
+      const rootResult = await dialog.showOpenDialog(window, {
+        title: 'Selecciona la carpeta raíz de las pistas del setlist',
+        properties: ['openDirectory']
+      });
+      if (rootResult.canceled || rootResult.filePaths.length === 0) return null;
+      const rootDirectory = path.resolve(rootResult.filePaths[0]);
+      const missing = [];
+
+      for (const track of missingTracks) {
+        const candidate = path.resolve(rootDirectory, track.relativePath);
+        const relative = path.relative(rootDirectory, candidate);
+        if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+          throw new Error('El archivo del setlist intenta acceder fuera de la carpeta de pistas.');
+        }
+        try {
+          const stat = await fs.stat(candidate);
+          if (!stat.isFile()) throw new Error('no es un archivo');
+          resolvedTracks.set(track, candidate);
+        } catch (error) {
+          if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error;
+          missing.push(track.relativePath);
+        }
+      }
+
+      if (missing.length === 0) break;
+      for (const track of missingTracks) resolvedTracks.delete(track);
+      const response = await dialog.showMessageBox(window, {
+        type: 'warning',
+        title: 'Faltan pistas del setlist',
+        message: `No se encontraron ${missing.length} pista(s) en esa carpeta.`,
+        detail: missing.slice(0, 12).join('\n'),
+        buttons: ['Relocalizar carpeta raíz', 'Cancelar'],
+        defaultId: 0,
+        cancelId: 1
+      });
+      if (response.response !== 0) return null;
+    }
+  }
+
+  const songIdMap = new Map(document.songs.map((song) => [song.id, randomUUID()]));
+  const importedSongs = document.songs.map((song) => ({
+    ...song,
+    id: songIdMap.get(song.id),
+    tracks: song.tracks.map((track) => ({
+      ...track,
+      id: randomUUID(),
+      path: resolvedTracks.get(track)
+    }))
+  }));
+  const importedSetlist = {
+    ...document.setlist,
+    id: randomUUID(),
+    songIds: document.setlist.songIds.map((id) => songIdMap.get(id))
+  };
+  const importedLibrary = {
+    songs: [...library.songs, ...importedSongs],
+    setlists: [...library.setlists, importedSetlist]
+  };
+  validateLibrary(migrateLibrary(importedLibrary));
+  await saveLibrary(migrateLibrary(importedLibrary));
+  return { setlistId: importedSetlist.id, name: importedSetlist.name, songCount: importedSongs.length };
+});
+
 ipcMain.handle('library:save', async (_event, nextLibrary) => {
   validateLibrary(nextLibrary);
   const knownPaths = new Set(allowedTrackPaths);

@@ -961,7 +961,9 @@ body.settings-active .setlist-detail-view,
 body.settings-active .library-browser-view { display: none; }
 body.settings-active #settings-view { display: block !important; }
 body.settings-active .app-shell { grid-template-columns: minmax(190px, 252px) minmax(0, 1fr); }
-.setlists-view-topline { margin-bottom: 24px; }
+.setlists-view-topline { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 24px; }
+.setlist-tools { display: flex; flex: 0 0 auto; gap: 8px; padding-top: 6px; }
+.setlist-tools .button:disabled { cursor: not-allowed; opacity: .5; }
 .setlists-view-topline h1,
 .setlist-detail-topline h1 { margin: 7px 0 0; font-size: 27px; font-weight: 600; letter-spacing: -.8px; }
 .setlists-view-intro { max-width: 610px; margin: 9px 0 0; color: var(--muted); font-size: 11px; line-height: 1.65; }
@@ -1050,6 +1052,9 @@ body.settings-active #player-view { display: none; }
     .import-dialog[open] > .import-song-trigger { top: 16px; right: 16px; }
     .setlists-view, .setlist-detail-view { min-height: auto; padding: 24px 18px; }
     .setlists-view-topline h1, .setlist-detail-topline h1 { font-size: 22px; }
+    .setlists-view-topline { flex-wrap: wrap; }
+    .setlist-tools { order: 2; width: 100%; padding-top: 0; }
+    .setlist-tools > * { flex: 1; }
     .setlist-create-card { align-items: stretch; flex-direction: column; gap: 14px; padding: 16px; }
     .create-setlist-form { width: 100%; }
     .setlist-cards { grid-template-columns: 1fr; }

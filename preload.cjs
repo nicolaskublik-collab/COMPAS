@@ -6,6 +6,8 @@ contextBridge.exposeInMainWorld('multitracks', {
   createClickSong: (name) => ipcRenderer.invoke('library:create-click-song', name),
   deleteSong: (songId) => ipcRenderer.invoke('library:delete-song', songId),
   saveLibrary: (library) => ipcRenderer.invoke('library:save', library),
+  exportSetlist: (setlistId) => ipcRenderer.invoke('setlist:export', setlistId),
+  importSetlist: () => ipcRenderer.invoke('setlist:import'),
   readTrack: (filePath) => ipcRenderer.invoke('track:read', filePath),
   loadSettings: () => ipcRenderer.invoke('settings:load'),
   saveSettings: (settings) => ipcRenderer.invoke('settings:save', settings),

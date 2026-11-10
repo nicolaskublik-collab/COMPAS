@@ -21,6 +21,7 @@ Reproductor multitrack local para preparar canciones y setlists.
 - Ordena las canciones con las flechas del detalle del setlist; esos números también permiten saltar directamente con las teclas 1–9.
 - Cambia de canción desde la cola o con las flechas del teclado. El motor prepara la siguiente mientras suena la actual y hace una transición corta entre ambas sin cerrar el dispositivo.
 - El botón «Setlist actual» abre rápidamente el detalle de la lista seleccionada.
+- Usa **Exportar setlist** para guardar un archivo `.compas` con el orden, la mezcla y las rutas relativas de las pistas; al exportar, elige una carpeta raíz que contenga todos los stems. **Importar .compas** incorpora una copia del setlist y, si las pistas no se encuentran, permite elegir otra carpeta raíz conservando la estructura de subcarpetas.
 - El visor muestra la forma de onda RMS; haz clic sobre ella para buscar. Agrega puntos, marca inicio y fin de regiones y activa la repetición de una región.
 - El transporte conserva el contador, Play/Pausa, Reiniciar y Detener; la posición se cambia desde el visor de onda.
 - Por defecto, Espacio reproduce/pausa, las flechas recorren el setlist y los números 1–9 abren esa posición. En Configuración, Key Learn permite personalizar teclas del teclado integrado o externo.

@@ -9,6 +9,8 @@ const elements = {
   setlistSongsList: document.querySelector('#setlist-songs-list'),
   setlistSongCount: document.querySelector('#setlist-song-count'),
   setlistAddSongs: document.querySelector('#setlist-add-songs'),
+  importSetlistButton: document.querySelector('#import-setlist-button'),
+  exportSetlistButton: document.querySelector('#export-setlist-button'),
   libraryReturn: document.querySelector('.library-return'),
   activeSetlistSelect: document.querySelector('#active-setlist-select'),
   openCurrentSetlist: document.querySelector('#open-current-setlist'),
@@ -487,6 +489,7 @@ function renderSetlists() {
   elements.activeSetlistSelect.value = state.activeSetlistId ?? '';
   elements.activeSetlistSelect.disabled = state.library.setlists.length === 0;
   elements.openCurrentSetlist.disabled = !state.activeSetlistId;
+  elements.exportSetlistButton.disabled = !activeSetlist;
   elements.openCurrentSetlist.textContent = activeSetlist
     ? `Setlist: ${activeSetlist.name}`
     : 'Setlist actual';
@@ -1623,6 +1626,42 @@ elements.setlistForm.addEventListener('submit', (event) => {
   scheduleSave();
   window.location.hash = 'setlist-detail-view';
   setStatus(`Setlist «${name}» creado.`);
+});
+
+elements.importSetlistButton.addEventListener('click', async () => {
+  elements.importSetlistButton.disabled = true;
+  try {
+    const imported = await window.multitracks.importSetlist();
+    if (!imported) return;
+    state.library = await window.multitracks.loadLibrary();
+    renderAll();
+    openSetlist(imported.setlistId);
+    window.location.hash = state.isPlaying && imported.songCount > 0 ? 'player-view' : 'setlist-detail-view';
+    setStatus(`Setlist «${imported.name}» importado con ${imported.songCount} canción(es).`);
+  } catch (error) {
+    setStatus(`No se pudo importar el setlist: ${error.message}`);
+  } finally {
+    elements.importSetlistButton.disabled = false;
+  }
+});
+
+elements.exportSetlistButton.addEventListener('click', async () => {
+  if (!state.activeSetlistId) {
+    setStatus('Selecciona un setlist antes de exportarlo.');
+    return;
+  }
+  elements.exportSetlistButton.disabled = true;
+  try {
+    const filePath = await window.multitracks.exportSetlist(state.activeSetlistId);
+    if (filePath) {
+      const setlist = state.library.setlists.find((item) => item.id === state.activeSetlistId);
+      setStatus(`Setlist «${setlist?.name ?? ''}» exportado correctamente.`);
+    }
+  } catch (error) {
+    setStatus(`No se pudo exportar el setlist: ${error.message}`);
+  } finally {
+    elements.exportSetlistButton.disabled = !state.library.setlists.some((item) => item.id === state.activeSetlistId);
+  }
 });
 
 elements.clickSongForm.addEventListener('submit', async (event) => {
