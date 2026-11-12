@@ -65,11 +65,15 @@ struct PreparedSong {
   int clickBeats{4}, clickRoute{-1};
 };
 struct AudioCommand {
-  enum Type { Activate, Pause, Resume, Stop, Seek, Pads, Loop } type{Pause};
+  enum Type { Activate, Pause, Resume, Stop, Seek, Pads, Loop, Mix, Bus } type{Pause};
   PreparedSong* song{nullptr};
   uint64_t position{0}, end{0};
   int key{-1}, route{-1};
   double volume{0}, fade{1};
+  float master{1}, setlist{1}, clickVolume{0};
+  bool clickEnabled{false};
+  double clickBpm{120};
+  int clickBeats{4}, clickRoute{-1};
 };
 struct AudioEngine {
   std::shared_ptr<const TrackSet> tracks{std::make_shared<const TrackSet>()};
@@ -717,9 +721,15 @@ int audioCallback(void* outputBuffer, void*, unsigned int frames,
   if (status) e.underruns.fetch_add(1, std::memory_order_relaxed);
   const uint64_t rampFrames = std::max(1U, e.sampleRate / 100); // 10 ms
   AudioCommand command;
+  const auto applyMixState = [&](const AudioCommand& mix) {
+    e.masterVolume.store(mix.master); e.setlistVolume.store(mix.setlist);
+    e.clickEnabled.store(mix.clickEnabled); e.clickVolume.store(mix.clickVolume);
+    e.clickBpm.store(mix.clickBpm); e.clickBeats.store(mix.clickBeats); e.clickOutputChannel.store(mix.clickRoute);
+  };
   for (size_t count = 0; count < 128 && e.commands.pop(command); ++count) {
     switch (command.type) {
       case AudioCommand::Activate:
+        applyMixState(command);
         e.transportEvent.store(0);
         e.outgoing = e.running ? e.current : nullptr;
         e.outgoingCursor = e.cursor;
@@ -765,6 +775,8 @@ int audioCallback(void* outputBuffer, void*, unsigned int frames,
         e.pads.select(command.key, command.volume, command.route, e.sampleRate, command.fade);
         break;
       case AudioCommand::Loop: e.loopStart = command.position; e.loopEnd = command.end; break;
+      case AudioCommand::Mix: applyMixState(command); break;
+      case AudioCommand::Bus: e.setlistVolume.store(static_cast<float>(command.volume)); break;
     }
   }
   auto* output = static_cast<float*>(outputBuffer);
@@ -912,7 +924,7 @@ std::shared_ptr<PreparedSong> prepareSong(const json& request, unsigned int rate
   return song;
 }
 
-void applyMix(AudioEngine& engine, const json& request);
+void applyMix(AudioEngine& engine, const json& request, bool publish = true);
 void activateSong(AudioEngine& e, const std::shared_ptr<PreparedSong>& prepared, const json& request) {
   auto active = std::make_shared<PreparedSong>(*prepared);
   active->request = request; active->activationId = ++e.nextActivation;
@@ -926,8 +938,11 @@ void activateSong(AudioEngine& e, const std::shared_ptr<PreparedSong>& prepared,
   active->clickRoute = click.value("outputChannel", -1);
   e.liveSongs.push_back(active);
   e.tracks = active->tracks;
-  applyMix(e, request);
+  applyMix(e, request, false);
   AudioCommand command; command.type = AudioCommand::Activate; command.song = active.get();
+  command.master = active->master; command.setlist = active->setlist;
+  command.clickEnabled = active->clickEnabled; command.clickVolume = active->clickVolume;
+  command.clickBpm = active->clickBpm; command.clickBeats = active->clickBeats; command.clickRoute = active->clickRoute;
   command.position = std::min<uint64_t>(static_cast<uint64_t>(request.value("startOffsetSeconds", 0.0) * e.sampleRate), active->duration);
   e.duration.store(active->duration); e.finished.store(false);
   enqueue(e, command);
@@ -945,9 +960,7 @@ json testDualDeckCrossfade() {
   return {{"passed", valid}, {"crossfadeMs", 10}};
 }
 
-void applyMix(AudioEngine& engine, const json& request) {
-  engine.masterVolume.store(request.value("masterVolume", engine.masterVolume.load()));
-  engine.setlistVolume.store(request.value("setlistVolume", engine.setlistVolume.load()));
+void applyMix(AudioEngine& engine, const json& request, bool publish) {
   const auto& values = request.at("tracks");
   const auto tracks = engine.tracks;
   if (!values.is_array() || values.size() != tracks->size()) {
@@ -963,11 +976,17 @@ void applyMix(AudioEngine& engine, const json& request) {
   const auto metronome = request.value("metronome", json::object());
   if (routedChannelCount(metronome.value("outputChannel", -1)) > static_cast<int>(engine.outputChannels))
     throw std::runtime_error("El click requiere salidas no disponibles.");
-  engine.clickEnabled.store(metronome.value("enabled", engine.clickEnabled.load()));
-  engine.clickVolume.store(metronome.value("volume", engine.clickVolume.load()));
-  engine.clickOutputChannel.store(metronome.value("outputChannel", engine.clickOutputChannel.load()));
-  engine.clickBpm.store(metronome.value("bpm", engine.clickBpm.load()));
-  engine.clickBeats.store(metronome.value("beats", engine.clickBeats.load()));
+  if (publish) {
+    AudioCommand mix; mix.type = AudioCommand::Mix;
+    mix.master = request.value("masterVolume", engine.masterVolume.load());
+    mix.setlist = request.value("setlistVolume", engine.setlistVolume.load());
+    mix.clickEnabled = metronome.value("enabled", engine.clickEnabled.load());
+    mix.clickVolume = metronome.value("volume", engine.clickVolume.load());
+    mix.clickRoute = metronome.value("outputChannel", engine.clickOutputChannel.load());
+    mix.clickBpm = metronome.value("bpm", engine.clickBpm.load());
+    mix.clickBeats = metronome.value("beats", engine.clickBeats.load());
+    enqueue(engine, mix);
+  }
 }
 
 void runEngine() {
@@ -1105,7 +1124,9 @@ void runEngine() {
         if (action == "loop") { c.type = AudioCommand::Loop; c.position = request.value("startFrame", 0ULL); c.end = request.value("endFrame", 0ULL); }
         enqueue(engine, c);
       } else if (action == "mix") applyMix(engine, request);
-      else if (action == "bus") engine.setlistVolume.store(request.at("volume").get<float>());
+      else if (action == "bus") {
+        AudioCommand bus; bus.type = AudioCommand::Bus; bus.volume = request.at("volume").get<double>(); enqueue(engine, bus);
+      }
       else if (action == "pads") {
         AudioCommand c; c.type = AudioCommand::Pads; c.key = request.value("key", -1);
         c.volume = request.value("volume", 0.3); c.route = request.value("outputChannel", -1); c.fade = request.value("fadeSeconds", 1.0);
@@ -1188,7 +1209,9 @@ json testPreparation() {
   generation.store(2);
   const auto cancelled = prepareSong(request, 48000, 2, generation, 1);
   AudioEngine engine;
+  request["masterVolume"] = 0.25;
   activateSong(engine, result, request);
+  const bool staged = engine.masterVolume.load() == 1.0F;
   float output[512 * 2]{};
   audioCallback(output, nullptr, 512, 0, 0, &engine);
   const auto firstPosition = engine.position.load();
@@ -1197,10 +1220,12 @@ json testPreparation() {
   stop.type = AudioCommand::Resume; enqueue(engine, stop);
   audioCallback(output, nullptr, 512, 0, 0, &engine);
   const bool passed = result && cached && cached->metadata["cachedTracks"] == 1 && !cancelled
-    && firstPosition == 512 && engine.position.load() == 512 && written == 48000;
+    && firstPosition == 512 && engine.position.load() == 512 && written == 48000
+    && staged && engine.masterVolume.load() == 0.25F;
   std::filesystem::remove_all(directory);
   return {{"passed", passed}, {"preparedFrames", result->duration}, {"cachedTracks", cached->metadata["cachedTracks"]},
-    {"cancelledStalePreparation", !cancelled}, {"restartReusesPCM", engine.position.load() == 512}};
+    {"cancelledStalePreparation", !cancelled}, {"restartReusesPCM", engine.position.load() == 512},
+    {"blockSynchronousActivation", staged && engine.masterVolume.load() == 0.25F}};
 }
 
 int main(int argc, char** argv) {
