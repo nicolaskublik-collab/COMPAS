@@ -1102,19 +1102,10 @@ body.settings-active #player-view { display: none; }
 
 @media (max-width: 430px) {
   .library-panel { padding-right: 13px; padding-left: 13px; }
-  .create-click-song-form .button { padding: 0 8px;   }
-
-  @media (max-width: 760px) {
-    .song-rhythm-controls { flex-wrap: wrap; gap: 9px; }
-    .rhythm-sync-note { flex-basis: 100%; margin-left: 0; }
-    .rhythm-sync-status { max-width: 100%; margin-left: auto; }
-  }
-
-  @media (max-width: 430px) {
-    .waveform-heading { flex-wrap: wrap; }
-    .rhythm-sync-status { flex-basis: 100%; margin-left: 0; text-align: left; }
-    .waveform-canvas-wrap { height: 128px; }
-  }
+  .create-click-song-form .button { padding: 0 8px; }
+  .waveform-heading { flex-wrap: wrap; }
+  .rhythm-sync-status { flex-basis: 100%; margin-left: 0; text-align: left; }
+  .waveform-canvas-wrap { height: 128px; }
   .track-list { margin-right: -13px; }
   .track-row { flex-basis: 150px; min-width: 150px; }
   .session-detail { align-items: flex-start; }
@@ -1160,4 +1151,40 @@ body.settings-active #player-view { display: none; }
   .song-cues { grid-template-columns: 1fr; }
   .waveform-edit-controls .button { min-height: 32px; }
   .setlist-song-reorder { flex-direction: column; }
+}
+
+
+/* Navigation state and compact-window safeguards. */
+.pads-panel { margin: 22px 0 12px; padding: 18px; border: 1px solid #354137; border-radius: 12px; background: #151d18; }
+.pads-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.pads-heading h2 { margin: 2px 0; font-size: 19px; }
+.pads-description, #pads-status { color: #aeb8af; font-size: 12px; line-height: 1.5; }
+.pads-keys { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 6px; margin: 14px 0; }
+.pad-key { min-height: 48px; border: 1px solid #465344; border-radius: 8px; background: #202a21; color: #d9e6d7; font: inherit; cursor: pointer; }
+.pad-key[aria-pressed="true"] { color: #15200d; background: #c1f06b; border-color: #c1f06b; box-shadow: 0 0 16px #c1f06b20; }
+.pad-key:focus-visible { outline: 2px solid #c1f06b; outline-offset: 3px; }
+.pads-controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
+.pads-controls label { display: flex; align-items: center; gap: 7px; color: #c2cec1; font-size: 12px; }
+.pads-controls select { max-width: 190px; padding: 6px; border: 1px solid #465344; border-radius: 5px; background: #202a21; color: #d9e6d7; }
+.pads-controls input[type="range"] { width: 100px; accent-color: #c1f06b; }
+@media (max-width: 900px) { .pads-keys { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
+
+.view-nav-link[aria-current="true"] {
+  border-color: #637d43;
+  color: var(--accent);
+  background: #283321;
+}
+
+@media (max-width: 760px) {
+  .song-rhythm-controls { flex-wrap: wrap; gap: 9px; }
+  .rhythm-sync-note { flex-basis: 100%; margin-left: 0; }
+  .rhythm-sync-status { max-width: 100%; margin-left: auto; }
+  .topbar { align-items: flex-start; flex-wrap: wrap; }
+  .breadcrumb { flex: 0 0 auto; padding-top: 8px; }
+  .topbar-right { min-width: 0; flex: 1 1 100%; }
+}
+
+@media (max-width: 520px) {
+  .topbar-right { align-items: center; justify-content: flex-start; }
+  .view-navigation { max-width: 100%; flex-wrap: wrap; gap: 5px; }
 }

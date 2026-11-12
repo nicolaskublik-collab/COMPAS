@@ -1,6 +1,6 @@
 {
   "name": "multitracks-live",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "license": "GPL-3.0-only",
   "description": "Reproductor multitrack local para uso en vivo",
@@ -8,9 +8,12 @@
   "scripts": {
     "build:native": "node scripts/build-native.cjs",
     "start": "npm run build:native && electron .",
-    "check": "node --check main.cjs && node --check preload.cjs && node --check renderer.js && node --check waveform-worker.js && node --check scripts/build-native.cjs && npm run build:native",
-    "test:native": "native\\build\\Release\\compas-audio.exe --test-pitch && native\\build\\Release\\compas-audio.exe --test-tempo-sync && native\\build\\Release\\compas-audio.exe --test-pitch-protection && native\\build\\Release\\compas-audio.exe --test-click-routing && native\\build\\Release\\compas-audio.exe --test-transition-fade && native\\build\\Release\\compas-audio.exe --test-dual-deck-crossfade && native\\build\\Release\\compas-audio.exe --test-track-cache",
-    "dist:win": "npm run build:native && electron-builder --win nsis --x64 --publish never"
+    "check": "node --check main.cjs && node --check preload.cjs && node --check renderer.js && node --check waveform-worker.js && node --check pads.js && node --check scripts/build-native.cjs && npm run build:native",
+    "test:native": "native\\build\\Release\\compas-audio.exe --test-pitch && native\\build\\Release\\compas-audio.exe --test-tempo-sync && native\\build\\Release\\compas-audio.exe --test-pitch-protection && native\\build\\Release\\compas-audio.exe --test-click-routing && native\\build\\Release\\compas-audio.exe --test-transition-fade && native\\build\\Release\\compas-audio.exe --test-dual-deck-crossfade && native\\build\\Release\\compas-audio.exe --test-track-cache && native\\build\\Release\\compas-audio.exe --test-realtime && native\\build\\Release\\compas-audio.exe --test-preparation",
+    "dist:win": "npm run build:native && electron-builder --win nsis --x64 --publish never",
+    "test:main": "node scripts/test-main.cjs",
+    "test:ui": "electron scripts/test-ui.cjs",
+    "test": "npm run test:main && npm run test:native && npm run test:ui"
   },
   "devDependencies": {
     "electron": "^45.2.3",
@@ -31,7 +34,8 @@
       "index.html",
       "styles.css",
       "README.md",
-      "LICENSE"
+      "LICENSE",
+      "pads.js"
     ],
     "extraResources": [
       {
@@ -63,7 +67,9 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "artifactName": "Compas-Setup-${version}-${arch}.${ext}"

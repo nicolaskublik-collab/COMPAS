@@ -249,6 +249,20 @@
             </div>
           </section>
 
+          <section class="pads-panel" aria-labelledby="pads-heading">
+            <div class="pads-heading"><div><p class="eyebrow">AMBIENTE CONTINUO</p><h2 id="pads-heading">Pads</h2></div>
+              <button type="button" class="button button-secondary" id="pads-stop">Apagar pads</button></div>
+            <p class="pads-description">Elegí una tonalidad. El ambiente sigue sonando al pausar o detener las pistas; apagalo con su botón.</p>
+            <div id="pads-keys" class="pads-keys" role="group" aria-label="Tonalidades de pads"></div>
+            <div class="pads-controls">
+              <label>Volumen <input id="pads-volume" type="range" min="0" max="100" value="30"><output id="pads-volume-value">30%</output></label>
+              <label>Salida <select id="pads-output"></select></label>
+              <label>Fundido <select id="pads-fade"><option value="0.5">0,5 s</option><option value="1.5" selected>1,5 s</option><option value="3">3 s</option><option value="5">5 s</option></select></label>
+              <label class="pads-follow"><input id="pads-follow" type="checkbox"> Seguir tonalidad de canción</label>
+            </div>
+            <p id="pads-status" role="status">Pads apagados</p>
+          </section>
+
           <footer class="workspace-footer">
             <span id="status-message" role="status" aria-live="polite">Todo listo. Añade una canción para comenzar.</span>
             <span class="audio-format"><span class="audio-dot" aria-hidden="true"></span> AUDIO LOCAL</span>

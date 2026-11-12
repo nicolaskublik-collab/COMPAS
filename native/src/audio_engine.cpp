@@ -6,6 +6,10 @@
 #include "miniaudio.h"
 
 #include "RtAudio.h"
+#include "realtime.h"
+#include <condition_variable>
+#include <future>
+#include <optional>
 #include "json.hpp"
 #include "signalsmith-stretch/signalsmith-stretch.h"
 
@@ -48,45 +52,52 @@ struct AudioTrack {
 
 using TrackSet = std::vector<std::shared_ptr<AudioTrack>>;
 
-struct TransitionDeck {
-  std::shared_ptr<const TrackSet> tracks;
-  std::atomic<uint64_t> position{0};
+struct PreparedSong {
+  std::shared_ptr<TrackSet> tracks;
+  json request;
+  json metadata;
   uint64_t duration{0};
-  float masterVolume{1.0F};
-  float setlistVolume{1.0F};
-  float clickVolume{0.0F};
+  uint64_t activationId{0};
+  double preparationMs{0};
+  float master{1}, setlist{1}, clickVolume{0};
   bool clickEnabled{false};
-  int clickOutputChannel{-1};
-  double clickBpm{120.0};
-  int clickBeats{4};
-  unsigned int sampleRate{kSampleRate};
-  std::atomic<uint64_t> fadeRemaining{0};
+  double clickBpm{120};
+  int clickBeats{4}, clickRoute{-1};
 };
-
+struct AudioCommand {
+  enum Type { Activate, Pause, Resume, Stop, Seek, Pads, Loop } type{Pause};
+  PreparedSong* song{nullptr};
+  uint64_t position{0}, end{0};
+  int key{-1}, route{-1};
+  double volume{0}, fade{1};
+};
 struct AudioEngine {
   std::shared_ptr<const TrackSet> tracks{std::make_shared<const TrackSet>()};
-  std::vector<std::shared_ptr<const TrackSet>> retiredTrackSets;
-  std::shared_ptr<TransitionDeck> transition;
   std::unique_ptr<RtAudio> audio;
   std::string api;
-  unsigned int deviceId{0};
-  std::atomic<uint64_t> playbackGeneration{0};
-  std::atomic<bool> playing{false};
-  std::atomic<bool> finished{false};
-  std::atomic<uint64_t> position{0};
-  std::atomic<uint64_t> duration{0};
-  std::atomic<float> masterVolume{1.0F};
-  std::atomic<float> setlistVolume{1.0F};
-  std::atomic<float> clickVolume{0.0F};
-  std::atomic<int> clickOutputChannel{-1};
-  std::atomic<double> clickBpm{120.0};
-  std::atomic<int> clickBeats{4};
+  unsigned int deviceId{0}, sampleRate{kSampleRate}, outputChannels{2};
+  unsigned int bufferFrames{512}, requestedBufferFrames{512}, requestedSampleRate{0};
+  std::atomic<bool> playing{false}, finished{false};
+  std::atomic<int> transportEvent{0};
+  std::atomic<uint64_t> position{0}, duration{0}, underruns{0}, liveFloor{0}, startedId{0};
+  std::atomic<float> masterVolume{1}, setlistVolume{1}, clickVolume{0};
+  std::atomic<int> clickOutputChannel{-1}, clickBeats{4};
+  std::atomic<double> clickBpm{120};
   std::atomic<bool> clickEnabled{false};
-  unsigned int outputChannels{2};
-  unsigned int sampleRate{kSampleRate};
-  unsigned int bufferFrames{512};
-  unsigned int requestedSampleRate{0};
+  AudioQueue<AudioCommand, 128> commands;
+  // Control owns these objects. Callback only borrows raw pointers until liveFloor advances.
+  std::vector<std::shared_ptr<PreparedSong>> liveSongs;
+  uint64_t nextActivation{0};
+  // The following state belongs exclusively to the callback while the stream is running.
+  PreparedSong* current{nullptr};
+  PreparedSong* outgoing{nullptr};
+  uint64_t cursor{0}, outgoingCursor{0}, loopStart{0}, loopEnd{0};
+  uint64_t pendingStartId{0};
+  bool running{false}, stopAfterFade{false};
+  AudioRamp transport, crossfade;
+  AmbientPads pads;
 };
+static_assert(std::atomic<uint64_t>::is_always_lock_free, "Audio requires lock-free 64-bit atomics");
 
 std::mutex outputMutex;
 
@@ -306,20 +317,21 @@ double effectiveDurationRatio(double durationRatio, bool dspEnabled) {
   return dspEnabled ? durationRatio : 1.0;
 }
 
-void addRoutedClick(float* output, unsigned int outputChannels, int route, float sample) {
+template<class Sample>
+void addRoutedClick(Sample* output, unsigned int outputChannels, int route, double sample) {
   if (route >= 0) {
     if (static_cast<unsigned int>(route) < outputChannels) {
-      output[route] += sample;
+      output[route] += static_cast<Sample>(sample);
     }
   } else if (route <= -2) {
     const unsigned int firstChannel = static_cast<unsigned int>(-route - 2);
     if (firstChannel + 1 < outputChannels) {
-      output[firstChannel] += sample;
-      output[firstChannel + 1] += sample;
+      output[firstChannel] += static_cast<Sample>(sample);
+      output[firstChannel + 1] += static_cast<Sample>(sample);
     }
   } else if (outputChannels >= 2) {
-    output[0] += sample;
-    output[1] += sample;
+    output[0] += static_cast<Sample>(sample);
+    output[1] += static_cast<Sample>(sample);
   }
 }
 
@@ -329,7 +341,8 @@ int routedChannelCount(int route) {
   return 2;
 }
 
-void mixTrackFrame(float* output, unsigned int outputChannels, const AudioTrack& track,
+template<class Sample>
+void mixTrackFrame(Sample* output, unsigned int outputChannels, const AudioTrack& track,
                    uint64_t frame, float gain) {
   const size_t sourceIndex = static_cast<size_t>(frame) * kChannels;
   if (sourceIndex + 1 >= track.samples.size()) return;
@@ -469,7 +482,7 @@ WaveformPeaks makeWaveform(const std::vector<float>& samples) {
 }
 
 bool readTrackCache(AudioTrack& track, const std::string& cacheDirectory, const std::string& cacheKey,
-                    unsigned int sampleRate) {
+                    unsigned int sampleRate, uint64_t maxBytes = UINT64_MAX) {
   if (cacheDirectory.empty() || cacheKey.size() != 64) return false;
   const std::filesystem::path cachePath = std::filesystem::u8path(cacheDirectory)
     / (cacheKey + ".cmpcache");
@@ -494,6 +507,8 @@ bool readTrackCache(AudioTrack& track, const std::string& cacheDirectory, const 
   }
   track.waveformMinimum.resize(header.waveformBins);
   track.waveformMaximum.resize(header.waveformBins);
+  if (header.frameCount > maxBytes / (kChannels * sizeof(float)))
+    throw std::runtime_error("La precarga excede el presupuesto de memoria.");
   track.samples.resize(static_cast<size_t>(header.frameCount) * kChannels);
   if (!input.read(reinterpret_cast<char*>(track.waveformMinimum.data()),
                   static_cast<std::streamsize>(track.waveformMinimum.size() * sizeof(float)))
@@ -637,7 +652,8 @@ std::unique_ptr<AudioTrack> loadTrack(const json& request, int semitones, unsign
   track->outputChannel.store(request.value("outputChannel", -1));
   track->pitchEnabled = request.value("pitchEnabled", true);
   const std::string cacheKey = request.value("cacheKey", std::string{});
-  const bool cacheHit = readTrackCache(*track, cacheDirectory, cacheKey, targetRate);
+  const uint64_t maxBytes = request.value("maxPreparedBytes", UINT64_MAX);
+  const bool cacheHit = readTrackCache(*track, cacheDirectory, cacheKey, targetRate, maxBytes);
   if (!cacheHit) {
     ma_decoder_config config = ma_decoder_config_init(ma_format_f32, kChannels, targetRate);
     ma_decoder decoder{};
@@ -658,6 +674,10 @@ std::unique_ptr<AudioTrack> loadTrack(const json& request, int semitones, unsign
       throw std::runtime_error("La duración de «" + name + "» no es válida.");
     }
 
+    if (frameCount > maxBytes / (kChannels * sizeof(float))) {
+      ma_decoder_uninit(&decoder);
+      throw std::runtime_error("La precarga excede el presupuesto de memoria.");
+    }
     track->samples.resize(static_cast<size_t>(frameCount) * kChannels);
     ma_uint64 framesRead = 0;
     result = ma_decoder_read_pcm_frames(&decoder, track->samples.data(), frameCount, &framesRead);
@@ -687,310 +707,262 @@ std::unique_ptr<AudioTrack> loadTrack(const json& request, int semitones, unsign
   return track;
 }
 
+void enqueue(AudioEngine& engine, const AudioCommand& command) {
+  if (!engine.commands.push(command)) throw std::runtime_error("La cola de audio esta llena; vuelve a intentar.");
+}
+
 int audioCallback(void* outputBuffer, void*, unsigned int frames,
-                  double, RtAudioStreamStatus, void* userData) {
-  auto* engine = static_cast<AudioEngine*>(userData);
+                  double, RtAudioStreamStatus status, void* userData) {
+  auto& e = *static_cast<AudioEngine*>(userData);
+  if (status) e.underruns.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t rampFrames = std::max(1U, e.sampleRate / 100); // 10 ms
+  AudioCommand command;
+  for (size_t count = 0; count < 128 && e.commands.pop(command); ++count) {
+    switch (command.type) {
+      case AudioCommand::Activate:
+        e.transportEvent.store(0);
+        e.outgoing = e.running ? e.current : nullptr;
+        e.outgoingCursor = e.cursor;
+        e.crossfade.value = e.outgoing ? 1.0 : 0.0;
+        e.crossfade.set(0, rampFrames);
+        e.current = command.song;
+        e.cursor = command.position;
+        e.loopStart = e.loopEnd = 0;
+        e.running = true;
+        e.stopAfterFade = false;
+        e.transport.value = 0;
+        e.transport.set(1, rampFrames);
+        e.pendingStartId = e.current->activationId;
+        break;
+      case AudioCommand::Pause:
+      case AudioCommand::Stop:
+        e.transportEvent.store(0);
+        e.transport.set(0, rampFrames);
+        e.stopAfterFade = command.type == AudioCommand::Stop;
+        if (!e.running) {
+          if (e.stopAfterFade) e.cursor = 0;
+          e.transportEvent.store(e.stopAfterFade ? 2 : 1);
+        }
+        break;
+      case AudioCommand::Resume:
+        if (e.current) {
+          if (e.stopAfterFade) e.cursor = 0;
+          e.running = true; e.stopAfterFade = false; e.transport.set(1, rampFrames);
+          e.transportEvent.store(3);
+        }
+        break;
+      case AudioCommand::Seek:
+        // Fade old samples out while the destination fades in; no disk access at a seek.
+        e.outgoing = e.running ? e.current : nullptr;
+        e.outgoingCursor = e.cursor;
+        e.crossfade.value = e.outgoing ? e.transport.value : 0;
+        e.crossfade.set(0, rampFrames);
+        e.cursor = command.position;
+        e.transport.value = 0;
+        e.transport.set(e.running ? 1 : 0, rampFrames);
+        break;
+      case AudioCommand::Pads:
+        e.pads.select(command.key, command.volume, command.route, e.sampleRate, command.fade);
+        break;
+      case AudioCommand::Loop: e.loopStart = command.position; e.loopEnd = command.end; break;
+    }
+  }
   auto* output = static_cast<float*>(outputBuffer);
-  const size_t outputSamples = static_cast<size_t>(frames) * engine->outputChannels;
-  std::fill(output, output + outputSamples, 0.0F);
-  if (!engine->playing.load()) return 0;
-
-  const uint64_t generation = engine->playbackGeneration.load();
-  const auto tracks = std::atomic_load(&engine->tracks);
-  const auto transition = std::atomic_load(&engine->transition);
-  const uint64_t startFrame = engine->position.load();
-  const uint64_t endFrame = engine->duration.load();
-  const float master = engine->masterVolume.load();
-  const float setlistMaster = engine->setlistVolume.load();
-
-  for (unsigned int frame = 0; frame < frames && startFrame + frame < endFrame; ++frame) {
-    const uint64_t songFrame = startFrame + frame;
-    for (const auto& track : *tracks) {
-      mixTrackFrame(output + static_cast<size_t>(frame) * engine->outputChannels,
-        engine->outputChannels, *track, songFrame, track->volume.load() * master);
-    }
-
-    if (engine->clickEnabled.load()) {
-      const float click = clickSample(songFrame, engine->sampleRate, engine->clickBpm.load(),
-        engine->clickBeats.load(), engine->clickVolume.load());
-      addRoutedClick(output + static_cast<size_t>(frame) * engine->outputChannels,
-        engine->outputChannels, engine->clickOutputChannel.load(), click);
-    }
-    float* mixedFrame = output + static_cast<size_t>(frame) * engine->outputChannels;
-    for (unsigned int channel = 0; channel < engine->outputChannels; ++channel) {
-      mixedFrame[channel] *= setlistMaster;
-    }
-
-    if (transition) {
-      const uint64_t remaining = transition->fadeRemaining.load();
-      const uint64_t transitionFrame = transition->position.load() + frame;
-      if (remaining > frame && transitionFrame < transition->duration) {
-        const uint64_t fadeTotal = static_cast<uint64_t>(transition->sampleRate) * 35 / 100;
-        const float fade = transitionFadeGain(remaining, frame, fadeTotal);
-        float* transitionOutput = output + static_cast<size_t>(frame) * engine->outputChannels;
-        for (const auto& track : *transition->tracks) {
-          mixTrackFrame(transitionOutput, engine->outputChannels, *track, transitionFrame,
-            track->volume.load() * transition->masterVolume * fade * transition->setlistVolume);
-        }
-        if (transition->clickEnabled) {
-          const float click = clickSample(transitionFrame, transition->sampleRate, transition->clickBpm,
-            transition->clickBeats, transition->clickVolume) * fade * transition->setlistVolume;
-          addRoutedClick(transitionOutput, engine->outputChannels, transition->clickOutputChannel, click);
-        }
+  const double master = e.masterVolume.load();
+  const double setlist = e.setlistVolume.load();
+  const bool clickEnabled = e.clickEnabled.load();
+  const double clickBpm = e.clickBpm.load();
+  const int clickBeats = e.clickBeats.load(), clickRoute = e.clickOutputChannel.load();
+  const float clickVolume = e.clickVolume.load();
+  for (unsigned int frame = 0; frame < frames; ++frame) {
+    double mixed[64]{};
+    if (e.running && e.current) {
+      if (e.loopEnd > e.loopStart && e.cursor >= e.loopEnd) {
+        e.outgoing = e.current; e.outgoingCursor = e.cursor;
+        e.crossfade.value = e.transport.value; e.crossfade.set(0, rampFrames);
+        e.cursor = e.loopStart; e.transport.value = 0; e.transport.set(1, rampFrames);
+      }
+      const double gain = e.transport.tick();
+      const double endFade = e.current->duration == UINT64_MAX ? 1.0
+        : std::min(1.0, static_cast<double>(e.current->duration - std::min(e.cursor, e.current->duration)) / rampFrames);
+      for (const auto& track : *e.current->tracks)
+        mixTrackFrame(mixed, e.outputChannels, *track, e.cursor, static_cast<float>(track->volume.load() * master * gain * endFade));
+      if (clickEnabled) addRoutedClick(mixed, e.outputChannels, clickRoute,
+        clickSample(e.cursor, e.sampleRate, clickBpm, clickBeats, clickVolume) * gain * endFade);
+      ++e.cursor;
+      if (!e.transport.remaining && e.transport.target == 0) {
+        e.running = false;
+        if (e.stopAfterFade) e.cursor = 0;
+        e.transportEvent.store(e.stopAfterFade ? 2 : 1);
+      } else if (e.cursor >= e.current->duration) {
+        e.running = false; e.cursor = 0; e.finished.store(true);
       }
     }
-  }
-  if (transition) {
-    const uint64_t remaining = transition->fadeRemaining.load();
-    const uint64_t consumed = std::min<uint64_t>(remaining, frames);
-    transition->position.store(std::min(transition->position.load() + frames, transition->duration));
-    transition->fadeRemaining.store(remaining - consumed);
-    if (remaining <= frames) std::atomic_store(&engine->transition, std::shared_ptr<TransitionDeck>{});
-  }
-  if (generation == engine->playbackGeneration.load()) {
-    engine->position.store(std::min(startFrame + frames, endFrame));
-    if (startFrame + frames >= endFrame) {
-      engine->playing.store(false);
-      engine->finished.store(true);
+    for (unsigned int channel = 0; channel < e.outputChannels; ++channel) mixed[channel] *= setlist;
+    if (e.outgoing) {
+      const double gain = e.crossfade.tick();
+      for (const auto& track : *e.outgoing->tracks)
+        mixTrackFrame(mixed, e.outputChannels, *track, e.outgoingCursor,
+          static_cast<float>(track->volume.load() * e.outgoing->master * gain * setlist));
+      if (e.outgoing->clickEnabled) addRoutedClick(mixed, e.outputChannels, e.outgoing->clickRoute,
+        clickSample(e.outgoingCursor, e.sampleRate, e.outgoing->clickBpm, e.outgoing->clickBeats,
+          e.outgoing->clickVolume) * gain * setlist);
+      ++e.outgoingCursor;
+      if (!e.crossfade.remaining) e.outgoing = nullptr;
     }
+    double left, right;
+    e.pads.sample(e.sampleRate, left, right);
+    if (e.pads.route == -1) { mixed[0] += left * setlist; if (e.outputChannels > 1) mixed[1] += right * setlist; }
+    else addRoutedClick(mixed, e.outputChannels, e.pads.route, (left + right) * 0.5 * setlist);
+    for (unsigned int channel = 0; channel < e.outputChannels; ++channel)
+      output[static_cast<size_t>(frame) * e.outputChannels + channel] = static_cast<float>(mixed[channel]);
   }
+  e.position.store(e.cursor, std::memory_order_relaxed);
+  e.playing.store(e.running, std::memory_order_relaxed);
+  if (e.pendingStartId) {
+    e.startedId.store(e.pendingStartId, std::memory_order_release);
+    e.pendingStartId = 0;
+  }
+  e.liveFloor.store(e.outgoing ? std::min(e.current->activationId, e.outgoing->activationId)
+    : e.current ? e.current->activationId : 0, std::memory_order_release);
   return 0;
 }
 
-json testDualDeckCrossfade() {
-  AudioEngine engine;
-  engine.outputChannels = 2;
-  engine.sampleRate = 1000;
-  engine.duration.store(1000);
-  engine.playing.store(true);
-  auto currentTrack = std::make_shared<AudioTrack>();
-  auto outgoingTrack = std::make_shared<AudioTrack>();
-  currentTrack->samples.assign(1000 * kChannels, 0.2F);
-  outgoingTrack->samples.assign(1000 * kChannels, 0.8F);
-  auto currentTracks = std::make_shared<TrackSet>();
-  currentTracks->push_back(currentTrack);
-  std::atomic_store(&engine.tracks, std::shared_ptr<const TrackSet>(currentTracks));
-  auto outgoing = std::make_shared<TransitionDeck>();
-  auto outgoingTracks = std::make_shared<TrackSet>();
-  outgoingTracks->push_back(outgoingTrack);
-  outgoing->tracks = outgoingTracks;
-  outgoing->duration = 1000;
-  outgoing->sampleRate = 1000;
-  outgoing->fadeRemaining.store(350);
-  std::atomic_store(&engine.transition, outgoing);
-  std::vector<float> output(100 * kChannels, 0.0F);
-  audioCallback(output.data(), nullptr, 100, 0.0, RTAUDIO_INPUT_OVERFLOW, &engine);
-  const float firstFrame = output[0];
-  const float lastFrame = output[(99 * kChannels)];
-  return {{"passed", std::abs(firstFrame - 1.0F) < 0.001F
-      && lastFrame < firstFrame && lastFrame > 0.2F},
-    {"firstFrame", firstFrame}, {"lastFrame", lastFrame}};
+void closeStream(AudioEngine& e) {
+  if (!e.audio) return;
+  if (e.audio->isStreamRunning()) e.audio->stopStream();
+  if (e.audio->isStreamOpen()) e.audio->closeStream();
+  e.audio.reset();
+  e.current = e.outgoing = nullptr;
+  AudioCommand discarded;
+  while (e.commands.pop(discarded)) {}
+  e.liveSongs.clear();
+  e.tracks = std::make_shared<const TrackSet>();
+  e.running = false; e.playing.store(false); e.position.store(0); e.duration.store(0);
+  e.transport = {}; e.pads = {};
+  e.pendingStartId = 0;
+  e.liveFloor.store(0); e.startedId.store(0); e.transportEvent.store(0);
 }
 
-void closeStream(AudioEngine& engine) {
-  if (!engine.audio) return;
-  try {
-    if (engine.audio->isStreamRunning()) engine.audio->stopStream();
-    if (engine.audio->isStreamOpen()) engine.audio->closeStream();
-  } catch (const std::exception& error) {
-    throw std::runtime_error(error.what());
-  }
-  engine.audio.reset();
-}
-
-void startPlayback(AudioEngine& engine, const json& request) {
-  const std::string apiString = request.value("api", "asio");
-  const RtAudio::Api api = parseApi(apiString);
+void configureDevice(AudioEngine& e, const json& request) {
+  const std::string api = request.at("api").get<std::string>();
   const unsigned int deviceId = request.at("deviceId").get<unsigned int>();
-  const unsigned int requestedSampleRate = request.value("sampleRate", 0U);
-  const unsigned int requestedBufferFrames = request.value("bufferFrames", 512U);
-  if (requestedSampleRate != 0
-      && requestedSampleRate != 44100 && requestedSampleRate != 48000
-      && requestedSampleRate != 88200 && requestedSampleRate != 96000) {
-    throw std::runtime_error("La frecuencia de muestreo seleccionada no está permitida.");
-  }
-  if (requestedBufferFrames != 64 && requestedBufferFrames != 128
-      && requestedBufferFrames != 256 && requestedBufferFrames != 512
-      && requestedBufferFrames != 1024 && requestedBufferFrames != 2048) {
-    throw std::runtime_error("El tamaño del búfer seleccionado no está permitido.");
-  }
-  const bool reuseStream = engine.audio
-    && engine.audio->isStreamOpen()
-    && engine.api == apiString
-    && engine.deviceId == deviceId
-    && engine.requestedSampleRate == requestedSampleRate
-    && engine.bufferFrames == requestedBufferFrames;
-  std::unique_ptr<RtAudio> nextAudio;
-  if (!reuseStream) nextAudio = std::make_unique<RtAudio>(api, [](RtAudioErrorType, const std::string&) {});
-  RtAudio* audio = reuseStream ? engine.audio.get() : nextAudio.get();
-  const auto devices = audio->getDeviceIds();
-  if (std::find(devices.begin(), devices.end(), deviceId) == devices.end()) {
-    throw std::runtime_error("El dispositivo de audio seleccionado ya no está disponible.");
-  }
+  const unsigned int rate = request.value("sampleRate", 0U), buffer = request.value("bufferFrames", 512U);
+  if (rate && rate != 44100 && rate != 48000 && rate != 88200 && rate != 96000)
+    throw std::runtime_error("Frecuencia no permitida.");
+  if (buffer != 64 && buffer != 128 && buffer != 256 && buffer != 512 && buffer != 1024 && buffer != 2048)
+    throw std::runtime_error("Buffer no permitido.");
+  if (e.audio && e.audio->isStreamOpen() && e.api == api && e.deviceId == deviceId
+      && e.requestedSampleRate == rate && e.requestedBufferFrames == buffer) return;
+  closeStream(e);
+  e.audio = std::make_unique<RtAudio>(parseApi(api), [](RtAudioErrorType, const std::string&) {});
+  const auto info = e.audio->getDeviceInfo(deviceId);
+  if (info.outputChannels < 2 || info.outputChannels > 64) throw std::runtime_error("Se requieren entre 2 y 64 salidas.");
+  e.sampleRate = rate ? rate : info.preferredSampleRate ? info.preferredSampleRate : kSampleRate;
+  e.outputChannels = info.outputChannels;
+  e.api = api; e.deviceId = deviceId; e.requestedSampleRate = rate; e.requestedBufferFrames = buffer;
+  e.bufferFrames = buffer;
+  RtAudio::StreamParameters output;
+  output.deviceId = deviceId; output.nChannels = e.outputChannels; output.firstChannel = 0;
+  auto result = e.audio->openStream(&output, nullptr, RTAUDIO_FLOAT32, e.sampleRate, &e.bufferFrames, audioCallback, &e);
+  if (result != RTAUDIO_NO_ERROR) throw std::runtime_error(e.audio->getErrorText());
+  result = e.audio->startStream();
+  if (result != RTAUDIO_NO_ERROR) throw std::runtime_error(e.audio->getErrorText());
+  emit({{"event", "device-ready"}, {"sampleRate", e.sampleRate}, {"bufferFrames", e.bufferFrames},
+    {"outputChannels", e.outputChannels}, {"latencyFrames", e.audio->getStreamLatency()}});
+}
 
-  const RtAudio::DeviceInfo device = audio->getDeviceInfo(deviceId);
-  if (device.name.empty() || device.outputChannels == 0) {
-    throw std::runtime_error("El dispositivo seleccionado no ofrece salidas de audio.");
-  }
-  const unsigned int preferredSampleRate = device.preferredSampleRate == 0 ? kSampleRate : device.preferredSampleRate;
-  const unsigned int sampleRate = requestedSampleRate == 0 ? preferredSampleRate : requestedSampleRate;
-  if (requestedSampleRate != 0 && !device.sampleRates.empty()
-      && std::find(device.sampleRates.begin(), device.sampleRates.end(), requestedSampleRate) == device.sampleRates.end()) {
-    throw std::runtime_error("El dispositivo no admite la frecuencia de muestreo seleccionada.");
-  }
-
-  const int semitones = request.value("pitchSemitones", 0);
-  const double targetBpm = request.value("targetBpm", 120.0);
-  if (!std::isfinite(targetBpm) || targetBpm < 30.0 || targetBpm > 300.0) {
-    throw std::runtime_error("El tempo objetivo de sincronización no es válido.");
-  }
-  const auto& trackRequests = request.at("tracks");
-  if (!trackRequests.is_array()) throw std::runtime_error("La lista de pistas no es válida.");
-  const std::string cacheDirectory = request.value("cacheDirectory", std::string{});
-  auto nextTracks = std::make_shared<TrackSet>();
-  nextTracks->reserve(trackRequests.size());
-  for (const auto& trackRequest : trackRequests) {
-    emit({{"event", "preparing"}, {"songId", request.value("songId", std::string{})},
+std::shared_ptr<PreparedSong> prepareSong(const json& request, unsigned int rate, unsigned int channels,
+    const std::atomic<uint64_t>& generation, uint64_t expected) {
+  const auto began = std::chrono::steady_clock::now();
+  auto song = std::make_shared<PreparedSong>();
+  song->request = request; song->tracks = std::make_shared<TrackSet>();
+  json waveforms = json::array(), analysis = json::array();
+  size_t cached = 0;
+  uint64_t remainingBytes = request.value("maxPreparedBytes", UINT64_MAX);
+  for (const auto& trackRequest : request.at("tracks")) {
+    if (generation.load() != expected) return nullptr;
+    emit({{"event", "preparing"}, {"songId", request.at("songId")}, {"preparationKey", request.at("preparationKey")},
       {"track", trackRequest.value("name", "")}});
-    auto track = loadTrack(trackRequest, semitones, sampleRate, targetBpm, cacheDirectory);
-    if (!track->cacheWarning.empty()) {
-      emit({{"event", "cache-warning"}, {"songId", request.value("songId", std::string{})},
-        {"message", track->cacheWarning}});
-    }
-    nextTracks->emplace_back(std::move(track));
-  }
-
-  uint64_t duration = 0;
-  size_t cachedTracks = 0;
-  int requiredChannels = 2;
-  json waveforms = json::array();
-  json trackAnalysis = json::array();
-  for (const auto& track : *nextTracks) {
-    if (track->cacheHit) ++cachedTracks;
-    duration = std::max<uint64_t>(duration, track->samples.size() / kChannels);
-    const int route = track->outputChannel.load();
-    requiredChannels = std::max(requiredChannels, routedChannelCount(route));
-
-    json minimum = json::array();
-    json maximum = json::array();
-    for (const float value : track->waveformMinimum) minimum.push_back(value);
-    for (const float value : track->waveformMaximum) maximum.push_back(value);
+    auto boundedRequest = trackRequest;
+    boundedRequest["maxPreparedBytes"] = remainingBytes;
+    auto track = loadTrack(boundedRequest, request.value("pitchSemitones", 0), rate,
+      request.value("targetBpm", 120.0), request.value("cacheDirectory", std::string{}));
+    const uint64_t bytes = track->samples.size() * sizeof(float);
+    if (bytes > remainingBytes) throw std::runtime_error("La precarga excede el presupuesto de memoria.");
+    remainingBytes -= bytes;
+    if (routedChannelCount(track->outputChannel.load()) > static_cast<int>(channels))
+      throw std::runtime_error("Una pista requiere salidas no disponibles.");
+    if (track->cacheHit) ++cached;
+    song->duration = std::max<uint64_t>(song->duration, track->samples.size() / kChannels);
     waveforms.push_back({{"id", track->id}, {"name", track->name},
-      {"minimum", std::move(minimum)}, {"maximum", std::move(maximum)}});
-    trackAnalysis.push_back({
-      {"id", track->id},
-      {"bpm", track->analyzedBpm},
-      {"confidence", track->tempoConfidence},
-      {"synced", track->tempoSynced}
-    });
+      {"minimum", track->waveformMinimum}, {"maximum", track->waveformMaximum}});
+    analysis.push_back({{"id", track->id}, {"bpm", track->analyzedBpm}, {"confidence", track->tempoConfidence}, {"synced", track->tempoSynced}});
+    if (!track->cacheWarning.empty()) emit({{"event", "cache-warning"}, {"songId", request.at("songId")}, {"message", track->cacheWarning}});
+    song->tracks->emplace_back(std::move(track));
   }
+  if (routedChannelCount(request.at("metronome").value("outputChannel", -1)) > static_cast<int>(channels))
+    throw std::runtime_error("El click requiere salidas no disponibles.");
+  const uint64_t displayDuration = song->duration;
+  if (request.value("clickOnly", false)) song->duration = UINT64_MAX;
+  song->preparationMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+  song->metadata = {{"songId", request.at("songId")}, {"preparationKey", request.at("preparationKey")},
+    {"durationFrames", displayDuration}, {"sampleRate", rate}, {"cachedTracks", cached},
+    {"waveforms", std::move(waveforms)}, {"trackAnalysis", std::move(analysis)}, {"preparationMs", song->preparationMs}};
+  return song;
+}
+
+void applyMix(AudioEngine& engine, const json& request);
+void activateSong(AudioEngine& e, const std::shared_ptr<PreparedSong>& prepared, const json& request) {
+  auto active = std::make_shared<PreparedSong>(*prepared);
+  active->request = request; active->activationId = ++e.nextActivation;
+  active->master = request.value("masterVolume", 1.0F);
+  active->setlist = request.value("setlistVolume", 1.0F);
   const auto click = request.value("metronome", json::object());
-  requiredChannels = std::max(requiredChannels,
-    routedChannelCount(click.value("outputChannel", -1)));
-  if (requiredChannels > static_cast<int>(device.outputChannels)) {
-    throw std::runtime_error("La asignación requiere " + std::to_string(requiredChannels)
-      + " salidas, pero el dispositivo solo ofrece " + std::to_string(device.outputChannels) + ".");
-  }
-  if (device.outputChannels < static_cast<unsigned int>(requiredChannels)) {
-    throw std::runtime_error("El número de salidas seleccionado no es válido para este dispositivo.");
-  }
+  active->clickEnabled = click.value("enabled", false);
+  active->clickVolume = click.value("volume", 0.6F);
+  active->clickBpm = click.value("bpm", 120.0);
+  active->clickBeats = click.value("beats", 4);
+  active->clickRoute = click.value("outputChannel", -1);
+  e.liveSongs.push_back(active);
+  e.tracks = active->tracks;
+  applyMix(e, request);
+  AudioCommand command; command.type = AudioCommand::Activate; command.song = active.get();
+  command.position = std::min<uint64_t>(static_cast<uint64_t>(request.value("startOffsetSeconds", 0.0) * e.sampleRate), active->duration);
+  e.duration.store(active->duration); e.finished.store(false);
+  enqueue(e, command);
+}
 
-  if (reuseStream && engine.playing.load()) {
-    auto outgoing = std::make_shared<TransitionDeck>();
-    outgoing->tracks = std::atomic_load(&engine.tracks);
-    outgoing->position.store(engine.position.load());
-    outgoing->duration = engine.duration.load();
-    outgoing->masterVolume = engine.masterVolume.load();
-    outgoing->setlistVolume = engine.setlistVolume.load();
-    outgoing->clickEnabled = engine.clickEnabled.load();
-    outgoing->clickVolume = engine.clickVolume.load();
-    outgoing->clickOutputChannel = engine.clickOutputChannel.load();
-    outgoing->clickBpm = engine.clickBpm.load();
-    outgoing->clickBeats = engine.clickBeats.load();
-    outgoing->sampleRate = engine.sampleRate;
-    outgoing->fadeRemaining.store(static_cast<uint64_t>(engine.sampleRate) * 35 / 100);
-    std::atomic_store(&engine.transition, std::move(outgoing));
-  } else {
-    std::atomic_store(&engine.transition, std::shared_ptr<TransitionDeck>{});
-  }
-
-  const bool clickOnly = request.value("clickOnly", false);
-  const uint64_t playbackDuration = clickOnly ? UINT64_MAX : duration;
-  const double startOffset = request.value("startOffsetSeconds", 0.0);
-  if (!std::isfinite(startOffset) || startOffset < 0.0) {
-    throw std::runtime_error("La posición inicial de la canción no es válida.");
-  }
-  const uint64_t startFrame = static_cast<uint64_t>(startOffset * sampleRate);
-
-  if (!reuseStream) {
-    engine.playbackGeneration.fetch_add(1);
-    engine.playing.store(false);
-    std::atomic_store(&engine.transition, std::shared_ptr<TransitionDeck>{});
-    closeStream(engine);
-    engine.audio = std::move(nextAudio);
-    engine.api = apiString;
-    engine.deviceId = deviceId;
-    engine.sampleRate = sampleRate;
-    engine.bufferFrames = requestedBufferFrames;
-    engine.requestedSampleRate = requestedSampleRate;
-    engine.outputChannels = device.outputChannels;
-  }
-
-  auto previousTracks = std::atomic_load(&engine.tracks);
-  if (previousTracks && !previousTracks->empty()) engine.retiredTrackSets.push_back(previousTracks);
-  engine.playbackGeneration.fetch_add(1);
-  if (!reuseStream) engine.playing.store(false);
-  engine.finished.store(false);
-  engine.position.store(std::min(startFrame, playbackDuration));
-  engine.duration.store(playbackDuration);
-  engine.masterVolume.store(request.value("masterVolume", 1.0F));
-  engine.setlistVolume.store(request.value("setlistVolume", 1.0F));
-  engine.clickEnabled.store(click.value("enabled", false));
-  engine.clickVolume.store(click.value("volume", 0.6F));
-  engine.clickOutputChannel.store(click.value("outputChannel", -1));
-  engine.clickBpm.store(click.value("bpm", 120.0));
-  engine.clickBeats.store(click.value("beats", 4));
-  std::shared_ptr<const TrackSet> immutableTracks = std::move(nextTracks);
-  std::atomic_store(&engine.tracks, std::move(immutableTracks));
-
-  engine.retiredTrackSets.erase(std::remove_if(engine.retiredTrackSets.begin(), engine.retiredTrackSets.end(),
-    [](const auto& trackSet) { return trackSet.use_count() == 1; }), engine.retiredTrackSets.end());
-
-  if (!reuseStream) {
-    RtAudio::StreamParameters output;
-    output.deviceId = deviceId;
-    output.nChannels = engine.outputChannels;
-    output.firstChannel = 0;
-    unsigned int bufferFrames = requestedBufferFrames;
-    auto result = engine.audio->openStream(&output, nullptr, RTAUDIO_FLOAT32, engine.sampleRate,
-      &bufferFrames, audioCallback, &engine);
-    if (result != RTAUDIO_NO_ERROR) throw std::runtime_error(engine.audio->getErrorText());
-    result = engine.audio->startStream();
-    if (result != RTAUDIO_NO_ERROR) throw std::runtime_error(engine.audio->getErrorText());
-  }
-  engine.playing.store(true);
-  emit({{"event", "playing"}, {"durationFrames", duration},
-    {"positionFrames", engine.position.load()},
-    {"sampleRate", engine.sampleRate}, {"outputChannels", engine.outputChannels},
-    {"bufferFrames", engine.bufferFrames}, {"cachedTracks", cachedTracks},
-    {"songId", request.value("songId", std::string{})},
-    {"waveforms", std::move(waveforms)}, {"trackAnalysis", std::move(trackAnalysis)}});
+json testDualDeckCrossfade() {
+  AudioEngine e; e.sampleRate = 1000;
+  auto first = std::make_shared<PreparedSong>(); first->tracks = std::make_shared<TrackSet>(); first->duration = 10000; first->activationId = 1;
+  auto second = std::make_shared<PreparedSong>(*first); second->tracks = std::make_shared<TrackSet>(); second->activationId = 2;
+  for (auto song : {first, second}) { auto track = std::make_shared<AudioTrack>(); track->samples.assign(20000, 0.2F); song->tracks->push_back(track); }
+  AudioCommand c; c.type = AudioCommand::Activate; c.song = first.get(); enqueue(e, c);
+  float output[200]{}; audioCallback(output, nullptr, 100, 0, 0, &e);
+  c.song = second.get(); enqueue(e, c); audioCallback(output, nullptr, 100, 0, 0, &e);
+  bool valid = true; for (float v : output) valid &= std::isfinite(v) && std::abs(v - 0.2F) < 0.03F;
+  return {{"passed", valid}, {"crossfadeMs", 10}};
 }
 
 void applyMix(AudioEngine& engine, const json& request) {
   engine.masterVolume.store(request.value("masterVolume", engine.masterVolume.load()));
   engine.setlistVolume.store(request.value("setlistVolume", engine.setlistVolume.load()));
   const auto& values = request.at("tracks");
-  const auto tracks = std::atomic_load(&engine.tracks);
+  const auto tracks = engine.tracks;
   if (!values.is_array() || values.size() != tracks->size()) {
     throw std::runtime_error("La mezcla enviada no coincide con las pistas cargadas.");
   }
   for (size_t index = 0; index < values.size(); ++index) {
+    if (routedChannelCount(values[index].value("outputChannel", -1)) > static_cast<int>(engine.outputChannels))
+      throw std::runtime_error("La pista requiere salidas no disponibles.");
     (*tracks)[index]->volume.store(values[index].value("volume", 1.0F));
     (*tracks)[index]->pan.store(values[index].value("pan", 0.0F));
     (*tracks)[index]->outputChannel.store(values[index].value("outputChannel", -1));
   }
   const auto metronome = request.value("metronome", json::object());
+  if (routedChannelCount(metronome.value("outputChannel", -1)) > static_cast<int>(engine.outputChannels))
+    throw std::runtime_error("El click requiere salidas no disponibles.");
   engine.clickEnabled.store(metronome.value("enabled", engine.clickEnabled.load()));
   engine.clickVolume.store(metronome.value("volume", engine.clickVolume.load()));
   engine.clickOutputChannel.store(metronome.value("outputChannel", engine.clickOutputChannel.load()));
@@ -1000,90 +972,244 @@ void applyMix(AudioEngine& engine, const json& request) {
 
 void runEngine() {
   AudioEngine engine;
-  std::mutex queueMutex;
+  std::mutex mutex; std::condition_variable wake;
   std::queue<std::string> commands;
-  std::atomic<bool> inputEnded{false};
-
-  std::thread inputThread([&] {
+  bool inputEnded = false;
+  std::thread input([&] {
     std::string line;
     while (std::getline(std::cin, line)) {
-      std::lock_guard<std::mutex> lock(queueMutex);
-      commands.push(line);
+      { std::lock_guard<std::mutex> lock(mutex); commands.push(line); }
+      wake.notify_one();
     }
-    inputEnded.store(true);
+    { std::lock_guard<std::mutex> lock(mutex); inputEnded = true; }
+    wake.notify_one();
   });
-
+  std::atomic<uint64_t> generation{0};
+  std::future<std::shared_ptr<PreparedSong>> worker;
+  std::optional<json> queued, autoplay;
+  std::string workerKey, workerSong;
+  bool workerPrefetch{false};
+  uint64_t workerGeneration = 0, reportedStarted = 0;
+  std::shared_ptr<PreparedSong> prepared;
+  std::vector<std::shared_ptr<PreparedSong>> readySongs;
+  auto launch = [&](const json& request) {
+    workerKey = request.at("preparationKey"); workerSong = request.at("songId");
+    workerPrefetch = request.value("action", "") == "prefetch";
+    workerGeneration = generation.load();
+    worker = std::async(std::launch::async, prepareSong, request, engine.sampleRate, engine.outputChannels,
+      std::cref(generation), workerGeneration);
+  };
   emit({{"event", "ready"}});
-  while (true) {
+  bool quitting = false;
+  while (!quitting) {
+    if (worker.valid() && worker.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+      try {
+        auto result = worker.get();
+        if (result && workerGeneration == generation.load()) {
+          prepared = result;
+          readySongs.push_back(result);
+          auto bytes = [](const auto& song) {
+            uint64_t total = 0;
+            for (const auto& track : *song->tracks) total += track->samples.size() * sizeof(float);
+            return total;
+          };
+          while (readySongs.size() > 2 || (readySongs.size() > 1
+              && bytes(readySongs.front()) + bytes(readySongs.back()) > 512ULL * 1024 * 1024))
+            readySongs.erase(readySongs.begin());
+          auto event = result->metadata; event["event"] = "prepared"; emit(event);
+          if (autoplay && autoplay->at("preparationKey") == result->request.at("preparationKey")) {
+            activateSong(engine, prepared, *autoplay); autoplay.reset();
+          }
+        }
+      } catch (const std::exception& error) {
+        if (workerGeneration == generation.load()) {
+          if (autoplay) {
+            // A small background prefetch can be upgraded to an unrestricted foreground load.
+            if (workerPrefetch && autoplay->at("preparationKey") == workerKey
+                && std::string(error.what()).find("presupuesto") != std::string::npos) {
+              queued = *autoplay; ++generation;
+            } else {
+              emit({{"event", "error"}, {"songId", workerSong}, {"preparationKey", workerKey}, {"message", error.what()}});
+              autoplay.reset();
+            }
+          } else emit({{"event", workerPrefetch ? "preparation-warning" : "error"}, {"songId", workerSong},
+            {"preparationKey", workerKey}, {"message", error.what()}});
+        }
+      }
+      workerKey.clear();
+      if (queued) { auto request = *queued; queued.reset(); launch(request); }
+    }
+    const auto started = engine.startedId.load(std::memory_order_acquire);
+    if (started != reportedStarted) {
+      reportedStarted = started;
+      for (const auto& song : engine.liveSongs) if (song->activationId == started) {
+        auto event = song->metadata; event["event"] = "playing";
+        const auto nowMs = std::chrono::duration<double, std::milli>(std::chrono::system_clock::now().time_since_epoch()).count();
+        event["acknowledgementMs"] = std::max(0.0, nowMs - song->request.value("requestedAtMs", nowMs));
+        event["positionFrames"] = engine.position.load(); event["bufferFrames"] = engine.bufferFrames; emit(event); break;
+      }
+    }
+    std::string activeSongId;
+    for (const auto& song : engine.liveSongs) if (song->activationId == started)
+      activeSongId = song->request.value("songId", std::string{});
+    const int transportEvent = engine.transportEvent.exchange(0);
+    if (transportEvent) emit({{"event", transportEvent == 1 ? "paused" : transportEvent == 2 ? "stopped" : "resumed"},
+      {"songId", activeSongId}, {"positionFrames", engine.position.load()}, {"sampleRate", engine.sampleRate}});
+    const auto floor = engine.liveFloor.load(std::memory_order_acquire);
+    engine.liveSongs.erase(std::remove_if(engine.liveSongs.begin(), engine.liveSongs.end(),
+      [floor](const auto& song) { return floor && song->activationId < floor; }), engine.liveSongs.end());
+    if (engine.finished.exchange(false)) emit({{"event", "ended"}, {"songId", activeSongId}});
     std::string line;
     {
-      std::lock_guard<std::mutex> lock(queueMutex);
-      if (!commands.empty()) {
-        line = std::move(commands.front());
-        commands.pop();
-      }
+      std::unique_lock<std::mutex> lock(mutex);
+      if (commands.empty()) wake.wait_for(lock, std::chrono::milliseconds(2), [&] { return inputEnded || !commands.empty(); });
+      if (!commands.empty()) { line = std::move(commands.front()); commands.pop(); }
+      else if (inputEnded) break;
     }
-    if (line.empty()) {
-      if (inputEnded.load()) break;
-      if (engine.finished.exchange(false)) emit({{"event", "ended"}});
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      continue;
-    }
-
-    std::string songId;
+    if (line.empty()) continue;
+    std::string songId, preparationKey;
     try {
       const json request = json::parse(line);
-      songId = request.value("songId", std::string{});
-      const auto action = request.at("action").get<std::string>();
-      if (action == "play") {
-        startPlayback(engine, request);
-      } else if (action == "pause") {
-        engine.playing.store(false);
-        emit({{"event", "paused"}, {"positionFrames", engine.position.load()}});
-      } else if (action == "resume") {
-        if (engine.audio && engine.audio->isStreamOpen()) {
-          engine.finished.store(false);
-          engine.playing.store(true);
-          emit({{"event", "playing"}, {"positionFrames", engine.position.load()}});
+      songId = request.value("songId", std::string{}); preparationKey = request.value("preparationKey", std::string{});
+      const std::string action = request.at("action");
+      if (action == "configure") {
+        ++generation; queued.reset(); autoplay.reset(); prepared.reset(); readySongs.clear();
+        closeStream(engine);
+        configureDevice(engine, request);
+      } else if (action == "prepare" || action == "play" || action == "prefetch") {
+        if (action == "prefetch" && (worker.valid() || queued || autoplay)) continue;
+        configureDevice(engine, request);
+        for (const auto& ready : readySongs) if (ready->request.at("preparationKey") == preparationKey) prepared = ready;
+        if (action == "play") autoplay = request;
+        else if (action == "prepare") autoplay.reset();
+        if (prepared && prepared->request.at("preparationKey") == preparationKey) {
+          if (worker.valid() && workerKey != preparationKey) { ++generation; queued.reset(); }
+          if (action == "play") { activateSong(engine, prepared, request); autoplay.reset(); }
+          else { auto event = prepared->metadata; event["event"] = "prepared"; emit(event); }
+        } else if (worker.valid() && workerKey == preparationKey && workerGeneration == generation.load()) {
+          // The existing preparation will satisfy this request.
         } else {
-          throw std::runtime_error("No hay una canción preparada para reanudar.");
+          ++generation;
+          if (worker.valid()) queued = request; else launch(request);
         }
-      } else if (action == "stop") {
-        engine.playing.store(false);
-        engine.position.store(0);
-        emit({{"event", "stopped"}});
-      } else if (action == "seek") {
-        engine.position.store(std::min<uint64_t>(request.at("positionFrames").get<uint64_t>(), engine.duration.load()));
-      } else if (action == "mix") {
-        applyMix(engine, request);
-      } else if (action == "status") {
-        emit({{"event", "status"}, {"playing", engine.playing.load()},
-          {"positionFrames", engine.position.load()}, {"durationFrames", engine.duration.load()},
-          {"sampleRate", engine.sampleRate}});
-      } else if (action == "shutdown") {
-        break;
-      } else {
-        throw std::runtime_error("Comando de audio desconocido.");
-      }
-    } catch (const std::exception& error) {
-      emit({{"event", "error"}, {"message", error.what()},
-        {"songId", songId}});
-    }
+      } else if (action == "pause" || action == "resume" || action == "stop" || action == "seek" || action == "loop") {
+        AudioCommand c;
+        if (action == "pause") { c.type = AudioCommand::Pause; autoplay.reset(); }
+        if (action == "resume") {
+          if (engine.liveSongs.empty()) throw std::runtime_error("No hay cancion preparada.");
+          // Resume keeps the currently active deck and does not reload samples.
+          c.type = AudioCommand::Resume;
+        }
+        if (action == "stop") { c.type = AudioCommand::Stop; autoplay.reset(); }
+        if (action == "seek") { c.type = AudioCommand::Seek; c.position = std::min(request.at("positionFrames").get<uint64_t>(), engine.duration.load()); }
+        if (action == "loop") { c.type = AudioCommand::Loop; c.position = request.value("startFrame", 0ULL); c.end = request.value("endFrame", 0ULL); }
+        enqueue(engine, c);
+      } else if (action == "mix") applyMix(engine, request);
+      else if (action == "bus") engine.setlistVolume.store(request.at("volume").get<float>());
+      else if (action == "pads") {
+        AudioCommand c; c.type = AudioCommand::Pads; c.key = request.value("key", -1);
+        c.volume = request.value("volume", 0.3); c.route = request.value("outputChannel", -1); c.fade = request.value("fadeSeconds", 1.0);
+        if (c.key < -1 || c.key > 11 || c.volume < 0 || c.volume > 1 || c.fade < 0.01 || c.fade > 10
+            || routedChannelCount(c.route) > static_cast<int>(engine.outputChannels)) throw std::runtime_error("Configuracion de pads invalida.");
+        if (!engine.audio) throw std::runtime_error("Selecciona un dispositivo antes de usar pads.");
+        enqueue(engine, c);
+        emit({{"event", "pads"}, {"key", c.key}});
+      } else if (action == "status") emit({{"event", "status"}, {"playing", engine.playing.load()}, {"songId", activeSongId},
+        {"positionFrames", engine.position.load()}, {"durationFrames", engine.duration.load() == UINT64_MAX ? 0 : engine.duration.load()},
+        {"sampleRate", engine.sampleRate}, {"bufferFrames", engine.bufferFrames}, {"underruns", engine.underruns.load()}});
+      else if (action == "shutdown") quitting = true;
+      else throw std::runtime_error("Comando desconocido.");
+    } catch (const std::exception& error) { emit({{"event", "error"}, {"songId", songId}, {"preparationKey", preparationKey}, {"message", error.what()}}); }
   }
+  ++generation;
+  closeStream(engine);
+  if (worker.valid()) worker.wait();
+  // stdin is closed by Electron before shutdown, so the reader can finish without a detached thread.
+  if (input.joinable()) input.join();
+}
 
-  engine.playing.store(false);
-  try {
-    closeStream(engine);
-  } catch (const std::exception& error) {
-    emit({{"event", "error"}, {"message", error.what()}});
+json testRealtime() {
+  AudioEngine e; e.sampleRate = 1000; e.outputChannels = 4;
+  auto song = std::make_shared<PreparedSong>();
+  song->activationId = 1; song->duration = 10000; song->tracks = std::make_shared<TrackSet>();
+  auto track = std::make_shared<AudioTrack>(); track->samples.assign(20000, 0.2F); song->tracks->push_back(track);
+  AudioCommand c; c.type = AudioCommand::Activate; c.song = song.get(); enqueue(e, c);
+  float output[400]{};
+  auto render = [&] { audioCallback(output, nullptr, 100, 0, 0, &e); };
+  render();
+  const bool started = e.playing.load() && e.position.load() == 100;
+  c.type = AudioCommand::Stop; enqueue(e, c); render();
+  const bool stopped = !e.playing.load() && e.position.load() == 0 && output[396] == 0;
+  c.type = AudioCommand::Resume; enqueue(e, c); render();
+  const bool resumed = e.playing.load() && e.position.load() == 100 && output[396] > 0;
+  c.type = AudioCommand::Loop; c.position = 50; c.end = 150; enqueue(e, c); render();
+  const bool looped = e.position.load() == 100;
+  c.type = AudioCommand::Pause; enqueue(e, c); render();
+  const auto pausedAt = e.position.load(); render();
+  const bool paused = !e.playing.load() && e.position.load() == pausedAt;
+  c.type = AudioCommand::Pads; c.key = 0; c.route = 2; c.volume = 0.5; c.fade = 0.01; enqueue(e, c); render();
+  bool routed = false, finite = true;
+  for (size_t i = 0; i < 100; ++i) {
+    routed |= std::abs(output[i * 4 + 2]) > 0.001;
+    finite &= std::isfinite(output[i * 4 + 2]) && output[i * 4] == 0 && output[i * 4 + 1] == 0 && output[i * 4 + 3] == 0;
   }
-  if (inputThread.joinable()) {
-    inputThread.detach();
-  }
+  c.key = 7; enqueue(e, c); render();
+  c.key = -1; enqueue(e, c); render();
+  bool silence = true; for (size_t i = 80 * 4; i < 400; ++i) silence &= output[i] == 0;
+  AudioQueue<uint64_t, 64> queue;
+  constexpr uint64_t count = 100000;
+  std::thread producer([&] { for (uint64_t i = 0; i < count; ++i) while (!queue.push(i)) std::this_thread::yield(); });
+  bool ordered = true;
+  for (uint64_t i = 0; i < count; ++i) { uint64_t value; while (!queue.pop(value)) std::this_thread::yield(); ordered &= value == i; }
+  producer.join();
+  return {{"passed", started && stopped && resumed && looped && paused && routed && finite && silence && ordered},
+    {"start", started}, {"stopKeepsDeck", stopped}, {"resume", resumed}, {"sampleAccurateLoop", looped},
+    {"pause", paused}, {"padIndependentRouting", routed && finite}, {"padFadeToSilence", silence}, {"spscOrdered", ordered}};
+}
+
+json testPreparation() {
+  const auto token = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto directory = std::filesystem::temp_directory_path() / ("compas-prepare-" + std::to_string(token));
+  std::filesystem::create_directories(directory);
+  const auto file = directory / "test.wav";
+  ma_encoder encoder;
+  auto config = ma_encoder_config_init(ma_encoding_format_wav, ma_format_f32, 2, 48000);
+  if (ma_encoder_init_file(file.string().c_str(), &config, &encoder) != MA_SUCCESS) throw std::runtime_error("Test WAV creation failed");
+  std::vector<float> samples(48000 * 2, 0.1F);
+  ma_uint64 written = 0;
+  ma_encoder_write_pcm_frames(&encoder, samples.data(), 48000, &written); ma_encoder_uninit(&encoder);
+  json request = {{"songId", "test"}, {"preparationKey", "test"}, {"cacheDirectory", directory.string()},
+    {"targetBpm", 120}, {"pitchSemitones", 0}, {"masterVolume", 1}, {"setlistVolume", 1},
+    {"metronome", {{"enabled", false}}}, {"tracks", json::array({{{"id", "track"}, {"path", file.string()},
+      {"name", "test"}, {"cacheKey", std::string(64, 'c')}}})}};
+  std::atomic<uint64_t> generation{1};
+  auto result = prepareSong(request, 48000, 2, generation, 1);
+  auto cached = prepareSong(request, 48000, 2, generation, 1);
+  generation.store(2);
+  const auto cancelled = prepareSong(request, 48000, 2, generation, 1);
+  AudioEngine engine;
+  activateSong(engine, result, request);
+  float output[512 * 2]{};
+  audioCallback(output, nullptr, 512, 0, 0, &engine);
+  const auto firstPosition = engine.position.load();
+  AudioCommand stop; stop.type = AudioCommand::Stop; enqueue(engine, stop);
+  audioCallback(output, nullptr, 512, 0, 0, &engine);
+  stop.type = AudioCommand::Resume; enqueue(engine, stop);
+  audioCallback(output, nullptr, 512, 0, 0, &engine);
+  const bool passed = result && cached && cached->metadata["cachedTracks"] == 1 && !cancelled
+    && firstPosition == 512 && engine.position.load() == 512 && written == 48000;
+  std::filesystem::remove_all(directory);
+  return {{"passed", passed}, {"preparedFrames", result->duration}, {"cachedTracks", cached->metadata["cachedTracks"]},
+    {"cancelledStalePreparation", !cancelled}, {"restartReusesPCM", engine.position.load() == 512}};
 }
 
 int main(int argc, char** argv) {
   try {
+    if (argc >= 2 && (std::string(argv[1]) == "--test-realtime" || std::string(argv[1]) == "--test-preparation")) {
+      const auto result = std::string(argv[1]) == "--test-realtime" ? testRealtime() : testPreparation();
+      std::cout << result.dump() << std::endl;
+      return result.at("passed").get<bool>() ? 0 : 1;
+    }
     if (argc >= 2 && std::string(argv[1]) == "--list-devices") {
       const std::string api = argc >= 3 ? argv[2] : "asio";
       std::cout << listDevices(api).dump() << std::endl;

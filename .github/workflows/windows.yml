@@ -30,8 +30,8 @@ jobs:
       - name: Check and build native audio engine
         run: npm run check
 
-      - name: Test audio engine
-        run: npm run test:native
+      - name: Test audio engine, IPC and interface
+        run: npm test
 
       - name: Build Windows installer
         run: npm run dist:win

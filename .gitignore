@@ -13,3 +13,6 @@ dist/
 native/build/
 native/vendor/asiosdk.zip
 /native/vendor/asiosdk/
+
+# LLM Chat Session Files
+llm-chat-sessions/

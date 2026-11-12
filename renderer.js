@@ -1,3 +1,4 @@
+import { PAD_KEYS, DEFAULT_PADS, keyIndex } from './pads.js';
 const elements = {
   setlistsButton: document.querySelector('#setlists-button'),
   libraryButton: document.querySelector('#library-button'),
@@ -27,6 +28,7 @@ const elements = {
   songRegions: document.querySelector('#song-regions'),
   libraryResultsList: document.querySelector('#library-results-list'),
   libraryResultsCount: document.querySelector('#library-results-count'),
+  librarySearchForm: document.querySelector('.library-search-form'),
   librarySearch: document.querySelector('#library-search'),
   libraryFilterArtist: document.querySelector('#library-filter-artist'),
   libraryFilterBpm: document.querySelector('#library-filter-bpm'),
@@ -131,7 +133,12 @@ const state = {
   waveformFailedKey: '',
   waveformWorker: null,
   pendingSongSwitch: null,
-  lastCacheWarning: ''
+  lastCacheWarning: '',
+  preparedKey: '',
+  preparingSongId: null,
+  padKey: -1,
+  actualSampleRate: 48000,
+  transportPending: false
 };
 
 if (!window.location.hash) window.location.hash = 'setlists-view';
@@ -283,6 +290,44 @@ function selectedSong() {
 
 function activeSetlist() {
   return state.library.setlists.find((setlist) => setlist.id === state.activeSetlistId) ?? null;
+}
+
+function renderPads() {
+  const config = { ...DEFAULT_PADS, ...state.settings.pads };
+  const container = document.querySelector('#pads-keys');
+  if (!container.children.length) PAD_KEYS.forEach((key, index) => {
+    const button = document.createElement('button'); button.type = 'button';
+    button.className = 'pad-key'; button.dataset.pad = index; button.textContent = key;
+    button.setAttribute('aria-label', 'Pad ' + key); container.append(button);
+  });
+  for (const button of container.children) button.setAttribute('aria-pressed', String(Number(button.dataset.pad) === state.padKey));
+  document.querySelector('#pads-volume').value = String(Math.round(config.volume * 100));
+  document.querySelector('#pads-volume-value').value = Math.round(config.volume * 100) + '%';
+  document.querySelector('#pads-output').innerHTML = renderOutputOptions(config.outputChannel);
+  document.querySelector('#pads-fade').value = String(config.fadeSeconds);
+  document.querySelector('#pads-follow').checked = config.followSong;
+  document.querySelector('#pads-status').textContent = state.padKey < 0 ? 'Pads apagados' : 'Pad ' + PAD_KEYS[state.padKey] + ' activo';
+}
+
+async function triggerPad(key) {
+  try {
+    if (!state.settings.selectedAudioDevice) { setStatus('Selecciona un dispositivo de audio.'); return; }
+    const bus = activeSetlist();
+    if (bus) await window.multitracks.audioCommand({ action: 'bus', setlistId: bus.id, volume: bus.masterVolume });
+    await window.multitracks.audioCommand({ action: 'pads', key });
+  } catch (error) { setStatus('Pads: ' + error.message); }
+}
+function followPadSong() {
+  if (!state.settings.pads?.followSong) return;
+  const song = selectedSong();
+  const key = keyIndex(song?.pitchTargetKey || song?.key);
+  if (key >= 0) triggerPad(key);
+}
+function syncNativeLoop() {
+  const region = selectedSong()?.regions?.find(r => r.id === state.loopRegionId);
+  const rate = state.actualSampleRate;
+  window.multitracks.audioCommand({ action: 'loop', startFrame: region ? Math.round(region.start * rate) : 0,
+    endFrame: region ? Math.round(region.end * rate) : 0 }).catch(error => setStatus(error.message));
 }
 
 function formatTime(seconds) {
@@ -656,6 +701,7 @@ function finishSongRegion() {
   song.regions.push(region);
   elements.cueName.value = '';
   state.loopRegionId = region.id;
+  syncNativeLoop();
   state.pendingRegionStart = null;
   elements.regionStartStatus.textContent = '';
   renderCues();
@@ -876,9 +922,15 @@ function updateCurrentViewLabel() {
     'settings-view': 'Configuración'
   };
   elements.currentViewLabel.textContent = labels[view] ?? 'Setlists';
+  elements.setlistsButton.setAttribute('aria-current', String(view === 'setlists-view' || view === 'setlist-detail-view'));
+  elements.libraryButton.setAttribute('aria-current', String(view === 'library-view'));
+  elements.settingsButton.setAttribute('aria-current', String(view === 'settings-view'));
 }
 
-window.addEventListener('hashchange', updateCurrentViewLabel);
+window.addEventListener('hashchange', () => {
+  showSettingsView(window.location.hash === '#settings-view');
+  updateCurrentViewLabel();
+});
 window.addEventListener('beforeunload', () => {
   state.waveformWorker?.terminate();
   state.waveformBitmap?.close();
@@ -900,7 +952,7 @@ function renderOutputOptions(selectedChannel) {
 
 function renderMidiMappings() {
   elements.midiMappingsList.replaceChildren();
-  const actionNames = {
+  const actionNames = { ...Object.fromEntries(PAD_KEYS.map((key, i) => ['pad' + i, 'Pad ' + key])), padsStop: 'Apagar pads',
     play: 'Reproducir / pausar', stop: 'Detener', next: 'Siguiente canción',
     previous: 'Canción anterior', restart: 'Reiniciar canción', addMarker: 'Agregar punto',
     regionStart: 'Marcar inicio de región', regionEnd: 'Marcar fin de región'
@@ -927,7 +979,7 @@ function renderMidiMappings() {
 
 function renderKeyboardMappings() {
   elements.keyboardMappingsList.replaceChildren();
-  const actionNames = {
+  const actionNames = { ...Object.fromEntries(PAD_KEYS.map((key, i) => ['pad' + i, 'Pad ' + key])), padsStop: 'Apagar pads',
     play: 'Reproducir / pausar', stop: 'Detener', next: 'Siguiente canción',
     previous: 'Canción anterior', restart: 'Reiniciar canción', addMarker: 'Agregar punto',
     regionStart: 'Marcar inicio de región', regionEnd: 'Marcar fin de región'
@@ -952,9 +1004,12 @@ function renderKeyboardMappings() {
   }
 }
 
+let settingsSaveRevision = 0;
 async function persistSettings() {
+  const revision = ++settingsSaveRevision;
   try {
     const savedSettings = await window.multitracks.saveSettings(state.settings);
+    if (revision !== settingsSaveRevision) return;
     state.settings = {
       ...state.settings,
       ...savedSettings,
@@ -1011,6 +1066,8 @@ async function refreshAsioDrivers() {
       : 'Selecciona un dispositivo para habilitar las salidas por pista.';
     renderTracks();
     await persistSettings();
+    renderPads();
+    await configureAudio();
   } catch (error) {
     elements.audioDriverStatus.textContent = `No se pudieron consultar los dispositivos ${api.toUpperCase()}: ${error.message}`;
   }
@@ -1037,6 +1094,8 @@ function refreshMidiInputOptions() {
 }
 
 function executeMidiAction(action) {
+  if (/^pad(?:[0-9]|1[01])$/.test(action)) { triggerPad(Number(action.slice(3))); return; }
+  if (action === 'padsStop') { triggerPad(-1); return; }
   if (action === 'play') {
     elements.playButton.click();
     return;
@@ -1193,7 +1252,9 @@ function audioTrackMix(song) {
 }
 
 function sendNativeMix() {
-  if (!state.audioPrepared && !state.isPlaying) return;
+  const bus = activeSetlist();
+  if (bus) window.multitracks.audioCommand({ action: 'bus', setlistId: bus.id, volume: bus.masterVolume }).catch(error => setStatus(error.message));
+  if (!state.audioPrepared) return;
   const song = selectedSong();
   if (!song) return;
   const setlist = activeSetlist();
@@ -1223,7 +1284,9 @@ function updateClickStatus() {
 
 function currentPosition() {
   if (!state.isPlaying) return state.offset;
-  return state.offset + performance.now() / 1000 - state.startedAt;
+  const position = state.offset + performance.now() / 1000 - state.startedAt;
+  const region = selectedSong()?.regions?.find(r => r.id === state.loopRegionId);
+  return region && position >= region.end ? region.start + (position - region.start) % (region.end - region.start) : position;
 }
 
 function updateTimeline() {
@@ -1237,21 +1300,7 @@ function updateTimeline() {
   elements.waveformCanvas.setAttribute('aria-valuenow', String(Math.min(position, maxPosition)));
   elements.waveformCanvas.setAttribute('aria-valuetext', formatTime(position));
   drawWaveform();
-  const loopRegion = selectedSong()?.regions?.find((region) => region.id === state.loopRegionId);
-  if (state.isPlaying && loopRegion && position >= loopRegion.end) {
-    seekFromWaveform(loopRegion.start);
-    return;
-  }
-  if (state.isPlaying && !song?.clickOnly && state.duration > 0 && position >= state.duration) {
-    state.offset = 0;
-    state.isPlaying = false;
-    window.clearInterval(state.timer);
-    state.timer = null;
-    setTransportButton(false);
-    elements.position.textContent = '00:00';
-    elements.progress.value = '0';
-    setStatus('Reproducción finalizada.');
-  }
+
 }
 
 function startPlaybackStatusTimer() {
@@ -1268,6 +1317,12 @@ function startPlaybackStatusTimer() {
 }
 
 async function startPlayback() {
+  if (state.pitchRefreshTimer) {
+    window.clearTimeout(state.pitchRefreshTimer);
+    state.pitchRefreshTimer = null;
+    window.clearTimeout(state.saveTimer);
+    await window.multitracks.saveLibrary(state.library);
+  }
   const song = selectedSong();
   if (!song) {
     setStatus('Primero añade una canción a la biblioteca.');
@@ -1291,19 +1346,19 @@ async function startPlayback() {
     setStatus('Selecciona un dispositivo de audio en Configuración.');
     return false;
   }
+  if (state.transportPending) return true;
+  state.transportPending = true;
   if (state.audioPrepared) {
+    sendNativeMix();
     await window.multitracks.audioCommand({ action: 'resume' });
-    state.startedAt = performance.now() / 1000;
-    state.isPlaying = true;
-    setTransportButton(true);
-    startPlaybackStatusTimer();
-    setStatus('Reproduciendo.');
+    setStatus('Reanudando...');
     return true;
   }
 
   setStatus('Preparando pistas y cambio de tono…');
   await window.multitracks.audioCommand({
     action: 'play',
+    preparationKey: state.preparedKey,
     songId: song.id,
     setlistId: setlist.id,
     startOffsetSeconds: state.offset,
@@ -1311,10 +1366,7 @@ async function startPlayback() {
     setlistVolume: setlist.masterVolume,
     tracks: audioTrackMix(song)
   });
-  state.startedAt = performance.now() / 1000;
-  state.isPlaying = true;
-  setTransportButton(true);
-  startPlaybackStatusTimer();
+  // Wait for the native callback acknowledgement before advancing the timeline.
   return true;
 }
 
@@ -1348,12 +1400,14 @@ async function restartPlayback() {
 }
 
 function stopPlayback() {
+  window.clearTimeout(state.pitchRefreshTimer);
+  state.pitchRefreshTimer = null;
+  state.transportPending = false;
   state.isPlaying = false;
   state.pendingSongSwitch = null;
   state.offset = 0;
   window.clearInterval(state.timer);
   state.timer = null;
-  state.audioPrepared = false;
   window.multitracks.audioCommand({ action: 'stop' })
     .catch((error) => setStatus(`No se pudo detener el audio: ${error.message}`));
   setTransportButton(false);
@@ -1391,7 +1445,9 @@ async function chooseSong(songId) {
     window.location.hash = 'player-view';
     return;
   }
-  const continuePlayback = state.isPlaying;
+  window.clearTimeout(state.pitchRefreshTimer);
+  state.pitchRefreshTimer = null;
+  const continuePlayback = state.isPlaying || state.transportPending;
   const now = performance.now() / 1000;
   const previous = continuePlayback
     ? state.pendingSongSwitch?.previous ?? {
@@ -1409,6 +1465,8 @@ async function chooseSong(songId) {
   state.timer = null;
   state.isPlaying = false;
   state.audioPrepared = false;
+  state.transportPending = false;
+  state.preparedKey = '';
   state.selectedSongId = songId;
   state.offset = 0;
   state.duration = 0;
@@ -1441,8 +1499,46 @@ async function chooseSong(songId) {
     }
   } else if (song) {
     setTransportButton(false);
-    setStatus(`${song.name} lista para reproducir.`);
+    prepareSelectedSong();
   }
+}
+
+async function prepareSelectedSong() {
+  const song = selectedSong(), setlist = activeSetlist();
+  if (!song || !setlist || !state.settings.selectedAudioDevice) return;
+  state.audioPrepared = false;
+  state.preparingSongId = song.id;
+  state.preparedKey = '';
+  setStatus('Preparando ' + song.name + '…');
+  try {
+    await window.multitracks.audioCommand({ action: 'prepare', songId: song.id, setlistId: setlist.id,
+      startOffsetSeconds: 0, masterVolume: Number(elements.masterVolume.value) / 100,
+      setlistVolume: setlist.masterVolume, tracks: audioTrackMix(song) });
+  } catch (error) { state.preparingSongId = null; setStatus(error.message); }
+}
+
+function prefetchNextSong() {
+  const setlist = activeSetlist();
+  const nextId = setlist?.songIds[setlist.songIds.indexOf(state.selectedSongId) + 1];
+  const next = state.library.songs.find(song => song.id === nextId);
+  if (!next) return;
+  window.multitracks.audioCommand({ action: 'prefetch', songId: next.id, setlistId: setlist.id,
+    startOffsetSeconds: 0, masterVolume: Number(elements.masterVolume.value) / 100,
+    setlistVolume: setlist.masterVolume, tracks: audioTrackMix(next) }).catch(() => {});
+}
+
+async function configureAudio() {
+  window.clearTimeout(state.pitchRefreshTimer);
+  state.pitchRefreshTimer = null;
+  window.clearInterval(state.timer);
+  state.timer = null;
+  state.isPlaying = false;
+  state.transportPending = false;
+  setTransportButton(false);
+  state.audioPrepared = false; state.preparedKey = ''; state.padKey = -1; renderPads();
+  if (!state.settings.selectedAudioDevice) return;
+  await window.multitracks.audioCommand({ action: 'configure' });
+  if (selectedSong()) await prepareSelectedSong();
 }
 
 function scheduleSave() {
@@ -1524,6 +1620,10 @@ async function importSongFromForm(event) {
 
 elements.importSongForm.addEventListener('submit', importSongFromForm);
 elements.importSongFiles.addEventListener('click', () => elements.importSongForm.requestSubmit());
+elements.librarySearchForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  renderLibraryResults();
+});
 
 elements.libraryResultsList.addEventListener('click', async (event) => {
   const addButton = event.target.closest('[data-add-library-song-id]');
@@ -1776,12 +1876,15 @@ elements.trackList.addEventListener('click', (event) => {
 
 elements.playButton.addEventListener('click', async () => {
   try {
-    if (state.isPlaying) {
+    if (state.transportPending) {
+      stopPlayback();
+    } else if (state.isPlaying) {
       pausePlayback();
     } else {
       await startPlayback();
     }
   } catch (error) {
+    state.transportPending = false;
     state.isPlaying = false;
     setTransportButton(false);
     setStatus(`No se pudo reproducir el audio: ${error.message}`);
@@ -1805,7 +1908,7 @@ elements.progress.addEventListener('change', () => {
   window.clearInterval(state.timer);
   state.timer = null;
   if (state.audioPrepared) {
-    const sampleRate = state.settings.selectedSampleRate
+    const sampleRate = state.actualSampleRate
       || state.audioDevices.find((device) => String(device.id) === state.settings.selectedAudioDevice)?.sampleRate
       || 48000;
     window.multitracks.audioCommand({
@@ -1881,11 +1984,13 @@ elements.songRegions.addEventListener('click', (event) => {
     if (region) seekFromWaveform(region.start);
   } else if (loopButton) {
     state.loopRegionId = state.loopRegionId === loopButton.dataset.loopRegionId ? null : loopButton.dataset.loopRegionId;
+    syncNativeLoop();
     renderCues();
     drawWaveform(true);
   } else if (removeButton) {
     song.regions = song.regions.filter((item) => item.id !== removeButton.dataset.removeRegionId);
     if (state.loopRegionId === removeButton.dataset.removeRegionId) state.loopRegionId = null;
+    syncNativeLoop();
     renderCues();
     drawWaveform(true);
     scheduleSave();
@@ -1909,10 +2014,13 @@ elements.setlistMasterVolume.addEventListener('input', () => {
 });
 
 function reprocessPitchSettings() {
-  if (!state.audioPrepared && !state.isPlaying) return;
+  const continuePlaying = state.isPlaying;
   state.offset = currentPosition();
+  state.audioPrepared = false;
+  state.preparedKey = '';
   window.clearTimeout(state.pitchRefreshTimer);
   state.pitchRefreshTimer = window.setTimeout(async () => {
+    state.pitchRefreshTimer = null;
     const offset = state.offset;
     state.isPlaying = false;
     state.audioPrepared = false;
@@ -1921,7 +2029,10 @@ function reprocessPitchSettings() {
     state.offset = offset;
     setTransportButton(false);
     try {
-      await startPlayback();
+      window.clearTimeout(state.saveTimer);
+      await window.multitracks.saveLibrary(state.library);
+      if (continuePlaying) await startPlayback();
+      else await prepareSelectedSong();
     } catch (error) {
       setStatus(`No se pudo aplicar el pitch: ${error.message}`);
     }
@@ -1952,6 +2063,7 @@ elements.clickBpm.addEventListener('change', () => {
   updateClickStatus();
   sendNativeMix();
   scheduleSave();
+  if (!song.clickOnly) reprocessPitchSettings();
 });
 elements.clickBeats.addEventListener('change', () => {
   const song = selectedSong();
@@ -1979,8 +2091,10 @@ async function showSettingsView(showSettings) {
 
 elements.settingsButton.addEventListener('click', (event) => {
   event.preventDefault();
-  state.settingsReturnHash = window.location.hash || '#setlists-view';
-  showSettingsView(true);
+  if (!document.body.classList.contains('settings-active')) {
+    state.settingsReturnHash = window.location.hash || '#setlists-view';
+  }
+  if (window.location.hash !== '#settings-view') window.location.hash = 'settings-view';
 });
 
 function showAppHelp() {
@@ -1993,16 +2107,9 @@ elements.closeHelpDialog.addEventListener('click', () => elements.helpDialog.clo
 
 elements.settingsReturnButton.addEventListener('click', (event) => {
   event.preventDefault();
-  showSettingsView(false);
   window.location.hash = state.settingsReturnHash.slice(1);
 });
 
-for (const navigationButton of [elements.setlistsButton, elements.libraryButton]) {
-  navigationButton.addEventListener('click', () => {
-    if (!document.body.classList.contains('settings-active')) return;
-    showSettingsView(false);
-  });
-}
 
 elements.refreshAudioDevices.addEventListener('click', refreshAsioDrivers);
 
@@ -2019,7 +2126,8 @@ elements.audioApiSelect.addEventListener('change', async () => {
 elements.asioDriverSelect.addEventListener('change', async () => {
   if (state.audioPrepared || state.isPlaying) stopPlayback();
   state.settings.selectedAudioDevice = elements.asioDriverSelect.value;
-  persistSettings();
+  await persistSettings();
+  await configureAudio();
   const device = state.audioDevices.find((item) => String(item.id) === state.settings.selectedAudioDevice);
   elements.asioChannelStatus.textContent = device
     ? `${device.name}: ${device.outputChannels} salidas · ${state.settings.selectedSampleRate || device.sampleRate} Hz · búfer ${state.settings.bufferFrames} muestras.`
@@ -2027,7 +2135,7 @@ elements.asioDriverSelect.addEventListener('change', async () => {
   renderTracks();
 });
 
-elements.audioSampleRate.addEventListener('change', () => {
+elements.audioSampleRate.addEventListener('change', async () => {
   const sampleRate = Number(elements.audioSampleRate.value);
   const device = state.audioDevices.find((item) => String(item.id) === state.settings.selectedAudioDevice);
   const supported = device && (sampleRate === 0 || (device.sampleRates ?? [device.sampleRate]).includes(sampleRate));
@@ -2039,17 +2147,19 @@ elements.audioSampleRate.addEventListener('change', () => {
   if (state.audioPrepared || state.isPlaying) stopPlayback();
   state.settings.selectedSampleRate = sampleRate;
   elements.asioChannelStatus.textContent = `${device.name}: ${device.outputChannels} salidas · ${sampleRate || device.sampleRate} Hz · búfer ${state.settings.bufferFrames} muestras.`;
-  persistSettings();
+  await persistSettings();
+  await configureAudio();
 });
 
-elements.audioBufferSize.addEventListener('change', () => {
+elements.audioBufferSize.addEventListener('change', async () => {
   if (state.audioPrepared || state.isPlaying) stopPlayback();
   state.settings.bufferFrames = Number(elements.audioBufferSize.value);
   const device = state.audioDevices.find((item) => String(item.id) === state.settings.selectedAudioDevice);
   if (device) {
     elements.asioChannelStatus.textContent = `${device.name}: ${device.outputChannels} salidas · ${state.settings.selectedSampleRate || device.sampleRate} Hz · búfer ${state.settings.bufferFrames} muestras.`;
   }
-  persistSettings();
+  await persistSettings();
+  await configureAudio();
 });
 
 elements.midiEnableButton.addEventListener('click', enableMidi);
@@ -2120,6 +2230,8 @@ elements.keyboardMappingsList.addEventListener('click', (event) => {
   persistSettings();
 });
 
+showSettingsView(window.location.hash === '#settings-view');
+
 window.addEventListener('keydown', (event) => {
   if (state.keyLearningAction) {
     if (['ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'ShiftLeft', 'ShiftRight', 'MetaLeft', 'MetaRight'].includes(event.code)) return;
@@ -2176,7 +2288,32 @@ window.addEventListener('keydown', (event) => {
   }
 });
 
+document.querySelector('#pads-keys').addEventListener('click', event => {
+  const button = event.target.closest('[data-pad]');
+  if (button) triggerPad(Number(button.dataset.pad));
+});
+document.querySelector('#pads-stop').addEventListener('click', () => triggerPad(-1));
+for (const id of ['pads-volume', 'pads-output', 'pads-fade', 'pads-follow']) {
+  document.querySelector('#' + id).addEventListener(id === 'pads-volume' ? 'input' : 'change', async () => {
+    state.settings.pads = {
+      volume: Number(document.querySelector('#pads-volume').value) / 100,
+      outputChannel: Number(document.querySelector('#pads-output').value),
+      fadeSeconds: Number(document.querySelector('#pads-fade').value),
+      followSong: document.querySelector('#pads-follow').checked
+    };
+    renderPads(); await persistSettings();
+    await triggerPad(state.padKey);
+  });
+}
+for (const select of [elements.midiLearnAction, elements.keyboardLearnAction]) {
+  if (!select) continue;
+  PAD_KEYS.forEach((key, i) => select.add(new Option('Pad ' + key, 'pad' + i)));
+  select.add(new Option('Apagar pads', 'padsStop'));
+}
+renderPads();
+
 window.multitracks.onAudioEvent((event) => {
+  if (event.songId && event.songId !== selectedSong()?.id) return;
   if (event.event === 'cache-warning') {
     if (!event.songId || event.songId === selectedSong()?.id) {
       state.lastCacheWarning = event.message;
@@ -2189,9 +2326,16 @@ window.multitracks.onAudioEvent((event) => {
     setStatus(`Preparando «${event.track}» y ajustando el pitch…`);
     return;
   }
-  if (event.event === 'playing') {
+  if (event.event === 'device-ready') {
+    state.actualSampleRate = event.sampleRate;
+    elements.asioChannelStatus.textContent = event.sampleRate + ' Hz · búfer real ' + event.bufferFrames
+      + ' · latencia del driver ' + event.latencyFrames + ' muestras';
+    return;
+  }
+  if (event.event === 'pads') { state.padKey = event.key; renderPads(); return; }
+  if (event.event === 'playing' || event.event === 'prepared') {
     if (event.songId && event.songId !== selectedSong()?.id) return;
-    state.pendingSongSwitch = null;
+    if (event.event === 'playing') state.pendingSongSwitch = null;
     renderSetlists();
     const song = selectedSong();
     const sampleRate = Number(event.sampleRate) || 48000;
@@ -2226,11 +2370,24 @@ window.multitracks.onAudioEvent((event) => {
         : 'No se pudo analizar el espectro';
     state.offset = Number(event.positionFrames ?? 0) / sampleRate;
     state.startedAt = performance.now() / 1000;
-    state.audioPrepared = true;
-    state.isPlaying = true;
+    state.preparedKey = event.preparationKey;
+    state.preparingSongId = null;
+    if (event.event === 'playing') {
+      syncNativeLoop();
+      state.transportPending = false;
+      state.audioPrepared = true;
+      state.isPlaying = true;
+      startPlaybackStatusTimer();
+      followPadSong();
+      prefetchNextSong();
+    }
     renderTracks();
-    setTransportButton(true);
+    setTransportButton(state.isPlaying);
     updateSongDuration();
+    if (event.event === 'prepared') {
+      setStatus((song?.name ?? 'Canción') + ' lista · preparación ' + Math.round(event.preparationMs) + ' ms');
+      drawWaveform(true); return;
+    }
     setStatus(state.lastCacheWarning || (song?.clickOnly
       ? 'Reproduciendo click. Pulsa Detener para terminar.'
       : cachedTracks
@@ -2241,19 +2398,27 @@ window.multitracks.onAudioEvent((event) => {
     return;
   }
   if (event.event === 'status') {
+    if (state.transportPending || state.pendingSongSwitch) return;
     const sampleRate = Number(event.sampleRate) || 48000;
     if (!selectedSong()?.clickOnly) state.duration = Number(event.durationFrames) / sampleRate;
     state.offset = Number(event.positionFrames) / sampleRate;
     state.isPlaying = event.playing === true;
     state.startedAt = performance.now() / 1000;
     state.audioPrepared = state.audioPrepared || event.playing === true;
+    if (event.underruns > 0) elements.audioRouteStatus.textContent = 'Interrupciones: ' + event.underruns;
     setTransportButton(state.isPlaying);
     updateSongDuration();
     drawWaveform();
     return;
   }
+  if (event.event === 'resumed') {
+    state.offset = Number(event.positionFrames) / event.sampleRate;
+    state.startedAt = performance.now() / 1000;
+    state.transportPending = false; state.isPlaying = true;
+    startPlaybackStatusTimer(); setTransportButton(true); return;
+  }
   if (event.event === 'paused') {
-    state.offset = Number(event.positionFrames ?? 0) / (state.audioDevices.find((device) => String(device.id) === state.settings.selectedAudioDevice)?.sampleRate ?? 48000);
+    state.offset = Number(event.positionFrames ?? 0) / (event.sampleRate || state.actualSampleRate);
     state.isPlaying = false;
     setTransportButton(false);
     return;
@@ -2261,14 +2426,14 @@ window.multitracks.onAudioEvent((event) => {
   if (event.event === 'stopped') {
     state.offset = 0;
     state.isPlaying = false;
-    state.audioPrepared = false;
     setTransportButton(false);
     return;
   }
   if (event.event === 'ended') {
+    state.transportPending = false;
     state.offset = 0;
     state.isPlaying = false;
-    state.audioPrepared = false;
+    state.audioPrepared = true;
     window.clearInterval(state.timer);
     state.timer = null;
     setTransportButton(false);
@@ -2285,6 +2450,7 @@ window.multitracks.onAudioEvent((event) => {
     return;
   }
   if (event.event === 'error') {
+    state.transportPending = false;
     if (event.songId && event.songId !== selectedSong()?.id) return;
     if (restorePendingSongSwitch(event.songId, `No se pudo cambiar de canción: ${event.message}`)) return;
     state.isPlaying = false;
@@ -2311,6 +2477,7 @@ window.multitracks.loadLibrary().then((library) => {
   state.settings = {
     ...state.settings,
     ...loadedSettings,
+    pads: { ...DEFAULT_PADS, ...loadedSettings.pads },
     selectedSampleRate: Number(loadedSettings.selectedSampleRate) || 0,
     bufferFrames: Number(loadedSettings.bufferFrames) || 512,
     midiMappings: Array.isArray(loadedSettings.midiMappings) ? loadedSettings.midiMappings : [],

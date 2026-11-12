@@ -21,7 +21,8 @@ const DEFAULT_SETTINGS = Object.freeze({
   selectedSampleRate: 0,
   bufferFrames: 512,
   midiMappings: [],
-  keyMappings: []
+  keyMappings: [],
+  pads: { volume: 0.3, outputChannel: -1, fadeSeconds: 1.5, followSong: false }
 });
 const execFileAsync = promisify(execFile);
 let window;
@@ -34,6 +35,10 @@ let audioEngineProcess = null;
 let audioEngineReadyPromise = null;
 let resolveAudioEngineReady = null;
 let rejectAudioEngineReady = null;
+let preparationRevision = 0;
+let settingsWrite = Promise.resolve();
+let libraryWrite = Promise.resolve();
+const preparedRequests = new Map();
 
 function isAudioPath(filePath) {
   return typeof filePath === 'string' && path.isAbsolute(filePath) && AUDIO_EXTENSIONS.has(path.extname(filePath).toLowerCase());
@@ -246,7 +251,12 @@ function validateSettings(value) {
     || !Array.isArray(value.keyMappings)) {
     throw new Error('La configuración de audio/MIDI tiene un formato inválido.');
   }
-  const allowedActions = new Set(['play', 'stop', 'next', 'previous', 'restart', 'addMarker', 'regionStart', 'regionEnd']);
+  const pad = value.pads;
+  if (!pad || !Number.isFinite(pad.volume) || pad.volume < 0 || pad.volume > 1
+    || !Number.isInteger(pad.outputChannel) || pad.outputChannel < -64 || pad.outputChannel > 63
+    || !Number.isFinite(pad.fadeSeconds) || pad.fadeSeconds < 0.01 || pad.fadeSeconds > 10
+    || typeof pad.followSong !== 'boolean') throw new Error('Configuración de pads inválida.');
+  const allowedActions = new Set(['padsStop', ...Array.from({length:12}, (_,i)=>`pad${i}`), 'play', 'stop', 'next', 'previous', 'restart', 'addMarker', 'regionStart', 'regionEnd']);
   const actions = new Set();
   for (const mapping of value.midiMappings) {
     if (!mapping
@@ -283,19 +293,29 @@ function validateSettings(value) {
 
 async function saveLibrary(nextLibrary) {
   validateLibrary(nextLibrary);
-  const temporaryPath = `${libraryPath}.tmp`;
-  await fs.writeFile(temporaryPath, JSON.stringify(nextLibrary, null, 2), 'utf8');
-  await fs.rename(temporaryPath, libraryPath);
-  library = nextLibrary;
-  allowedTrackPaths = new Set(library.songs.flatMap((song) => song.tracks.map((track) => track.path)));
+  const snapshot = structuredClone(nextLibrary);
+  const write = libraryWrite.catch(() => {}).then(async () => {
+    const temporaryPath = libraryPath + '.tmp';
+    await fs.writeFile(temporaryPath, JSON.stringify(snapshot, null, 2), 'utf8');
+    await fs.rename(temporaryPath, libraryPath);
+    library = snapshot;
+    allowedTrackPaths = new Set(library.songs.flatMap(song => song.tracks.map(track => track.path)));
+  });
+  libraryWrite = write;
+  return write;
 }
 
 async function saveSettings(nextSettings) {
   validateSettings(nextSettings);
-  const temporaryPath = `${settingsPath}.tmp`;
-  await fs.writeFile(temporaryPath, JSON.stringify(nextSettings, null, 2), 'utf8');
-  await fs.rename(temporaryPath, settingsPath);
-  settings = nextSettings;
+  const snapshot = structuredClone(nextSettings);
+  const write = settingsWrite.catch(() => {}).then(async () => {
+    const temporaryPath = settingsPath + '.tmp';
+    await fs.writeFile(temporaryPath, JSON.stringify(snapshot, null, 2), 'utf8');
+    await fs.rename(temporaryPath, settingsPath);
+    settings = snapshot;
+  });
+  settingsWrite = write;
+  return write;
 }
 
 async function loadLibrary() {
@@ -321,7 +341,8 @@ async function loadSettings() {
       bufferFrames: [64, 128, 256, 512, 1024, 2048].includes(parsed.bufferFrames)
         ? parsed.bufferFrames : 512,
       midiMappings: parsed.midiMappings ?? [],
-      keyMappings: Array.isArray(parsed.keyMappings) ? parsed.keyMappings : []
+      keyMappings: Array.isArray(parsed.keyMappings) ? parsed.keyMappings : [],
+      pads: { ...DEFAULT_SETTINGS.pads, ...(parsed.pads ?? {}) }
     };
     validateSettings(migrated);
     settings = migrated;
@@ -350,7 +371,10 @@ async function listAudioDevices(api) {
 function stopAudioEngineProcess() {
   if (audioEngineProcess && !audioEngineProcess.killed) {
     audioEngineProcess.stdin.end('{"action":"shutdown"}\n');
-    audioEngineProcess.kill();
+    const child = audioEngineProcess;
+    const timeout = setTimeout(() => { if (child.exitCode === null) child.kill(); }, 3000);
+    timeout.unref();
+    child.once('exit', () => clearTimeout(timeout));
   }
   audioEngineProcess = null;
   audioEngineReadyPromise = null;
@@ -395,6 +419,7 @@ function ensureAudioEngine() {
   });
   child.once('exit', (code) => {
     if (audioEngineProcess !== child) return;
+    rejectAudioEngineReady?.(new Error('El motor se cerró antes de estar listo.'));
     audioEngineProcess = null;
     audioEngineReadyPromise = null;
     const message = code === 0 ? 'El motor de audio se cerró.' : `El motor de audio finalizó (${stderr.trim() || `código ${code}`}).`;
@@ -444,13 +469,18 @@ async function addTrackCacheKeys(tracks, sampleRate) {
 }
 
 async function sendAudioCommand(command) {
+  const requestedAtMs = Date.now();
   if (!command || typeof command.action !== 'string') throw new Error('Comando de audio inválido.');
-  const allowedActions = new Set(['play', 'pause', 'resume', 'stop', 'seek', 'mix', 'status']);
+  const allowedActions = new Set(['bus', 'configure', 'prepare', 'prefetch', 'play', 'pause', 'resume', 'stop', 'seek', 'loop', 'mix', 'status', 'pads']);
   if (!allowedActions.has(command.action)) throw new Error('Comando de audio no permitido.');
+  const revision = ['prepare', 'play', 'configure', 'stop', 'pause'].includes(command.action)
+    ? ++preparationRevision : preparationRevision;
   await ensureAudioEngine();
+  if (['prepare', 'prefetch', 'play', 'mix', 'configure', 'pads', 'bus'].includes(command.action))
+    await Promise.all([settingsWrite, libraryWrite]);
 
   let payload = { action: command.action };
-  if (command.action === 'play' || command.action === 'mix') {
+  if (['prepare', 'prefetch', 'play', 'mix'].includes(command.action)) {
     const song = library.songs.find((item) => item.id === command.songId);
     if (!song) throw new Error('La canción solicitada ya no está en la biblioteca.');
     const setlist = library.setlists.find((item) => item.id === command.setlistId && item.songIds.includes(song.id));
@@ -476,9 +506,19 @@ async function sendAudioCommand(command) {
         throw new Error('La posición inicial de la canción no es válida.');
       }
       const pitchSemitones = song.pitchSemitones;
-      const tracksWithCache = await addTrackCacheKeys(tracks, settings.selectedSampleRate);
+      const ready = preparedRequests.get(command.preparationKey);
+      const compatibleReady = ready?.songId === song.id && ready.api === settings.selectedAudioApi
+        && ready.deviceId === deviceId && ready.sampleRate === settings.selectedSampleRate
+        && ready.bufferFrames === settings.bufferFrames && ready.pitchSemitones === pitchSemitones
+        && ready.targetBpm === song.bpm && ready.tracks.length === tracks.length
+        && tracks.every((track, index) => track.id === ready.tracks[index].id
+          && track.path === ready.tracks[index].path && track.pitchEnabled === ready.tracks[index].pitchEnabled);
+      const tracksWithCache = command.action === 'play' && compatibleReady
+        ? tracks.map((track, index) => ({ ...track, cacheKey: ready.tracks[index]?.cacheKey }))
+        : await addTrackCacheKeys(tracks, settings.selectedSampleRate);
       payload = {
-        action: 'play',
+        action: command.action,
+        requestedAtMs,
         songId: song.id,
         api: settings.selectedAudioApi,
         deviceId,
@@ -492,9 +532,34 @@ async function sendAudioCommand(command) {
         masterVolume,
         setlistVolume,
         metronome,
-        tracks: tracksWithCache
+        tracks: tracksWithCache,
+        preparationKey: createHash('sha256').update(JSON.stringify({ songId: song.id,
+          api: settings.selectedAudioApi, deviceId, sampleRate: settings.selectedSampleRate,
+          bufferFrames: settings.bufferFrames, pitchSemitones, targetBpm: song.bpm, clickOnly: song.clickOnly,
+          tracks: tracksWithCache.map(t => [t.id, t.cacheKey, t.pitchEnabled]) })).digest('hex')
       };
+      if (command.action === 'prepare' || command.action === 'prefetch') {
+        if (command.action === 'prefetch') payload.maxPreparedBytes = 256 * 1024 * 1024;
+        preparedRequests.set(payload.preparationKey, payload);
+        while (preparedRequests.size > 2) preparedRequests.delete(preparedRequests.keys().next().value);
+      }
     }
+  } else if (command.action === 'bus') {
+    if (!library.setlists.some(s => s.id === command.setlistId) || !Number.isFinite(command.volume)
+      || command.volume < 0 || command.volume > 1) throw new Error('Volumen de setlist invalido.');
+    payload = { action: 'bus', volume: command.volume };
+  } else if (command.action === 'configure') {
+    if (!settings.selectedAudioDevice) return false;
+    payload = { action: 'configure', api: settings.selectedAudioApi, deviceId: Number(settings.selectedAudioDevice),
+      sampleRate: settings.selectedSampleRate, bufferFrames: settings.bufferFrames };
+  } else if (command.action === 'pads') {
+    if (!Number.isInteger(command.key) || command.key < -1 || command.key > 11) throw new Error('Pad inválido.');
+    payload = { action: 'pads', key: command.key, volume: settings.pads.volume,
+      outputChannel: settings.pads.outputChannel, fadeSeconds: settings.pads.fadeSeconds };
+  } else if (command.action === 'loop') {
+    if (![command.startFrame, command.endFrame].every(v => Number.isSafeInteger(v) && v >= 0)
+      || (command.endFrame !== 0 && command.endFrame <= command.startFrame)) throw new Error('Región inválida.');
+    payload = { action: 'loop', startFrame: command.startFrame, endFrame: command.endFrame };
   } else if (command.action === 'seek') {
     if (!Number.isSafeInteger(command.positionFrames) || command.positionFrames < 0) {
       throw new Error('La posición solicitada no es válida.');
@@ -502,6 +567,7 @@ async function sendAudioCommand(command) {
     payload.positionFrames = command.positionFrames;
   }
 
+  if (['prepare', 'prefetch', 'play', 'configure'].includes(command.action) && revision !== preparationRevision) return false;
   return new Promise((resolve, reject) => {
     audioEngineProcess.stdin.write(`${JSON.stringify(payload)}\n`, (error) => {
       if (error) reject(new Error(`No se pudo enviar el comando al motor de audio: ${error.message}`));
